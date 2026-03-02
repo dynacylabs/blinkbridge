@@ -6,7 +6,7 @@ from typing import Dict, Tuple, Union
 from pathlib import Path
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
-from blinkpy.auth import Auth
+from blinkpy.auth import Auth, BlinkTwoFARequiredError, TokenRefreshFailed, LoginError
 from blinkpy.helpers.util import json_load
 from blinkbridge.config import *
 
@@ -42,20 +42,51 @@ class CameraManager:
         self.metadata = None
 
     async def _login(self) -> None:
+        """Login to Blink using OAuth v2 authentication."""
         self.blink = Blink(session=self.session)
         path_cred = PATH_CONFIG / ".cred.json"
 
         if not path_cred.exists():
-            log.debug(f"logging into Blink with login info")
-            self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=False)
+            log.info("Logging into Blink with credentials from config")
+            # Create Auth with login credentials for initial OAuth v2 flow
+            self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
         else:
-            log.debug(f"logging into Blink with saved creds")
-            self.blink.auth = Auth(await json_load(path_cred))
+            log.info("Logging into Blink with saved credentials")
+            # Load saved credentials (includes OAuth tokens, hardware_id, etc.)
+            saved_data = await json_load(path_cred)
+            self.blink.auth = Auth(saved_data, no_prompt=True, session=self.session)
 
-        await self.blink.start()
+        try:
+            # Start the Blink system (performs OAuth v2 authentication)
+            await self.blink.start()
+            log.info("Successfully authenticated with Blink")
+        except BlinkTwoFARequiredError:
+            # Prompt user for 2FA code
+            log.info("Two-factor authentication required")
+            twofa_code = input("Enter your 2FA code: ")
+            
+            # Complete 2FA login
+            success = await self.blink.send_2fa_code(twofa_code)
+            if not success:
+                log.error("2FA verification failed")
+                raise LoginError("2FA verification failed")
+            
+            log.info("Successfully authenticated with Blink (2FA completed)")
+        except (TokenRefreshFailed, LoginError) as e:
+            log.error(f"Authentication failed: {e}")
+            # If we have saved creds that failed, remove them so we retry with fresh login
+            if path_cred.exists():
+                log.info("Removing invalid saved credentials")
+                path_cred.unlink()
+            raise
 
+        # Save credentials after successful authentication (includes OAuth tokens)
         if not path_cred.exists():
-            log.debug(f"saving Blink creds")
+            log.info("Saving Blink credentials for future use")
+            await self.blink.save(path_cred)
+        else:
+            # Update saved credentials with refreshed tokens
+            log.debug("Updating saved credentials with refreshed tokens")
             await self.blink.save(path_cred)
 
     async def refresh_metadata(self) -> None:
