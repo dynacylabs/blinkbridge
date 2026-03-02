@@ -174,7 +174,14 @@ class CameraManager:
         await self.refresh_metadata()
     
     async def close(self) -> None:
-        await self.session.close()
+        """Properly close all connections and clean up resources."""
+        # Close the session only once (blink.auth.session is the same as self.session)
+        if hasattr(self, 'session') and self.session is not None:
+            if not self.session.closed:
+                await self.session.close()
+                # Give the event loop time to clean up SSL transports
+                # This prevents "Unclosed connector" warnings
+                await asyncio.sleep(0.25)
 
 async def test() -> None:
     cm = CameraManager()
