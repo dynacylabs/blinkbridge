@@ -143,7 +143,19 @@ class CameraManager:
         await self.refresh_metadata()
     
     async def close(self) -> None:
-        await self.session.close()
+        """Properly close all connections and clean up resources."""
+        # Close the Blink object first if it exists
+        if hasattr(self, 'blink') and self.blink is not None:
+            # Close the Blink auth session if it exists
+            if hasattr(self.blink, 'auth') and self.blink.auth is not None:
+                if hasattr(self.blink.auth, 'session') and self.blink.auth.session is not None:
+                    if not self.blink.auth.session.closed:
+                        await self.blink.auth.session.close()
+            
+        # Close our own session
+        if hasattr(self, 'session') and self.session is not None:
+            if not self.session.closed:
+                await self.session.close()
 
 async def test() -> None:
     cm = CameraManager()
