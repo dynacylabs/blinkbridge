@@ -5,7 +5,7 @@ FROM python:alpine
 RUN apk add --no-cache \
     ffmpeg \
     && pip install --upgrade pip \
-    && pip install rich blinkpy==0.23.0 aiohttp
+    && pip install rich blinkpy aiohttp
 
 # Add Intel hardware acceleration support for ffmpeg
 # RUN apk add --no-cache \
