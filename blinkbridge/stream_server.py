@@ -82,26 +82,38 @@ class StreamServer:
 
         # make still video from input video
         log.debug(f"{self.stream_name}: starting creating next still video {next_still_video}")
-        svc = StillVideoCreator(file_name_input_video,
-                                output_duration=CONFIG['still_video_duration'],
-                                file_name_still_video=next_still_video)
-        
-        # wait for enqueued video to start
-        if not still_only:
-            log.debug(f"{self.stream_name}: waiting for new video to start")
-            wait_until_file_open(file_name_input_video, self.process.pid)
+        try:
+            svc = StillVideoCreator(file_name_input_video,
+                                    output_duration=CONFIG['still_video_duration'],
+                                    file_name_still_video=next_still_video)
             
-        # enqueue next still video
-        log.debug(f'{self.stream_name}: waiting for still video creation to finish')
-        svc.wait()
-        self._enqueue_clip(next_still_video)
+            # wait for enqueued video to start
+            if not still_only:
+                log.debug(f"{self.stream_name}: waiting for new video to start")
+                wait_until_file_open(file_name_input_video, self.process.pid)
+                
+            # enqueue next still video
+            log.debug(f'{self.stream_name}: waiting for still video creation to finish')
+            svc.wait()
+            
+            # Verify the still video was created successfully
+            if not next_still_video.exists():
+                raise FileNotFoundError(f"Still video was not created: {next_still_video}")
+                
+            self._enqueue_clip(next_still_video)
 
-        # delete old still video
-        if self.current_still_video and not still_only:
-            log.debug(f'{self.stream_name}: deleting old still video {self.current_still_video}')
-            self.current_still_video.unlink()
-        
-        self.current_still_video = next_still_video
+            # delete old still video
+            if self.current_still_video and not still_only:
+                log.debug(f'{self.stream_name}: deleting old still video {self.current_still_video}')
+                self.current_still_video.unlink()
+            
+            self.current_still_video = next_still_video
+        except Exception as e:
+            log.error(f"{self.stream_name}: Failed to create still video: {e}")
+            # Clean up if still video was partially created
+            if next_still_video.exists():
+                next_still_video.unlink()
+            raise
     
     def is_running(self) -> bool:
         return self.process.poll() is None

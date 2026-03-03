@@ -36,11 +36,14 @@ class Application:
         else:
             log.info(f"{camera_name}: starting stream server")
         
-        stream_server = StreamServer(camera_name)
-        stream_server.start_server(file_name_initial_video)  
-        self.stream_servers[camera_name] = stream_server
-
-        return stream_server
+        try:
+            stream_server = StreamServer(camera_name)
+            stream_server.start_server(file_name_initial_video)  
+            self.stream_servers[camera_name] = stream_server
+            return stream_server
+        except Exception as e:
+            log.error(f"{camera_name}: failed to start stream server: {e}")
+            return None
 
     async def check_for_motion(self, camera_name: str) -> bool:
         ss = self.stream_servers[camera_name]

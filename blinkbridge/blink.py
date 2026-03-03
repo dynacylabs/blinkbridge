@@ -41,7 +41,8 @@ class CameraManager:
         self.camera_last_record = defaultdict(lambda: None)
         self.metadata = None
         self.black_video_path = None
-        self.cameras_without_clips = set()  # Track cameras that started with black screen
+        self.cameras_without_clips = set()  # Track cameras that currently don't have clips
+        self.cameras_ever_had_real_clip = set()  # Track cameras that have ever had a real clip (permanent within run)
 
     async def _login(self) -> None:
         """Login to Blink using OAuth v2 authentication."""
@@ -109,11 +110,17 @@ class CameraManager:
             '-f', 'lavfi',
             '-i', f'color=black:s={width}x{height}:d={duration}',
             '-f', 'lavfi',
-            '-i', 'anullsrc',
+            '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
             '-c:v', 'libx264',
+            '-profile:v', 'high',
+            '-level:v', '4.1',
             '-c:a', 'aac',
+            '-ar', '44100',
+            '-ac', '2',
+            '-b:a', '128k',
             '-t', str(duration),
             '-pix_fmt', 'yuv420p',
+            '-movflags', 'faststart',
             str(black_video_path)
         ]
         
@@ -148,7 +155,8 @@ class CameraManager:
     async def save_latest_clip(self, camera_name: str, force: bool=False, use_black_fallback: bool=True) -> Union[Path, None]:
         '''
         Download and save latest videos for camera.
-        If no clips available and use_black_fallback=True, returns path to black video.
+        If no clips available and use_black_fallback=True AND camera never had a real clip, returns path to black video.
+        Once a camera has had a real clip, it will never fall back to black screen.
         ''' 
         camera_name_sanitized = camera_name.lower().replace(' ', '_')
         file_name = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
@@ -156,8 +164,10 @@ class CameraManager:
         # don't download if clip already exists
         if file_name.exists() and not force:
             log.debug(f"{camera_name}: skipping download, {file_name} exists")
-            # Camera has a real clip now
-            self.cameras_without_clips.discard(camera_name)
+            # If this is a cached real clip (not black video), mark as having had real clip
+            if file_name != self.black_video_path:
+                self.cameras_without_clips.discard(camera_name)
+                self.cameras_ever_had_real_clip.add(camera_name)
             return file_name
 
         # skip deleted clips and camera snapshots
@@ -166,22 +176,35 @@ class CameraManager:
 
         if media is None:
             log.warning(f"{camera_name}: no clips found for camera")
-            if use_black_fallback and self.black_video_path:
-                log.info(f"{camera_name}: using black video placeholder")
+            # Only use black fallback if camera has NEVER had a real clip
+            if use_black_fallback and self.black_video_path and camera_name not in self.cameras_ever_had_real_clip:
+                log.info(f"{camera_name}: using black video placeholder (never had real clip)")
                 self.cameras_without_clips.add(camera_name)
                 return self.black_video_path
+            elif camera_name in self.cameras_ever_had_real_clip:
+                log.warning(f"{camera_name}: no new clips found, but camera has had real clips before - not falling back to black")
             return None
 
-        log.debug(f'{camera_name}: downloading video: {media}')
-        response = await self.blink.do_http_get(media['media'])
+        try:
+            log.debug(f'{camera_name}: downloading video: {media}')
+            response = await self.blink.do_http_get(media['media'])
 
-        log.debug(f'{camera_name}: saving video to {file_name}')
-        with open(file_name, 'wb') as f:
-            f.write(await response.read())
-        
-        # Camera has a real clip now
-        self.cameras_without_clips.discard(camera_name)
-        return file_name
+            log.debug(f'{camera_name}: saving video to {file_name}')
+            with open(file_name, 'wb') as f:
+                f.write(await response.read())
+            
+            # Camera has a real clip now (mark permanently)
+            self.cameras_without_clips.discard(camera_name)
+            self.cameras_ever_had_real_clip.add(camera_name)
+            log.debug(f"{camera_name}: successfully downloaded real clip")
+            return file_name
+        except Exception as e:
+            log.error(f"{camera_name}: failed to download clip: {e}")
+            # If download fails but camera had clips before, try to use cached file
+            if camera_name in self.cameras_ever_had_real_clip and file_name.exists():
+                log.warning(f"{camera_name}: using cached clip after download failure")
+                return file_name
+            return None
     
     async def _save_clip(self, camera_name: str, url: str, file_name: Path) -> None:
         camera = self.blink.cameras[camera_name]
@@ -221,6 +244,9 @@ class CameraManager:
                 log.debug(f"{camera_name}: found recent clip in snapshot, saving to {file_name}")
                 await self._save_clip(camera_name, url, file_name)
                 self.camera_last_record[camera_name] = camera.attributes['last_record']
+                # Mark as having real clip
+                self.cameras_without_clips.discard(camera_name)
+                self.cameras_ever_had_real_clip.add(camera_name)
                 log.info(f"{camera_name}: clip downloaded and saved to {file_name}")
             
                 return file_name
@@ -233,6 +259,9 @@ class CameraManager:
         log.debug(f"{camera_name}: downloading clip to {file_name}")
         await camera.video_to_file(file_name)
         self.camera_last_record[camera_name] = camera.attributes['last_record']
+        # Mark as having real clip
+        self.cameras_without_clips.discard(camera_name)
+        self.cameras_ever_had_real_clip.add(camera_name)
         log.info(f"{camera_name}: clip downloaded and saved to {file_name}")
 
         return file_name
