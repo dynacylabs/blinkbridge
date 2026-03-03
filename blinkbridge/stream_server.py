@@ -16,6 +16,7 @@ class StreamServer:
         self.stream_name = stream_name
         self.stream_name_sanitized = stream_name.replace(' ', '_').lower()
         self.current_still_video = None
+        self.process = None  # Initialize process to None
 
     def _run_server(self) -> str:
         output_url = f"{RTSP_URL}/{self.stream_name_sanitized}"
@@ -104,12 +105,27 @@ class StreamServer:
         self.current_still_video = next_still_video
     
     def is_running(self) -> bool:
-        return self.process.poll() is None
+        return self.process is not None and self.process.poll() is None
     
     def close(self) -> None:
-        if self.is_running():
-            log.info(f"{self.stream_name}: stopping server")
-            self.process.kill()
+        if not self.is_running():
+            return
+            
+        log.debug(f"{self.stream_name}: stopping stream server")
+        try:
+            # Try graceful termination first
+            self.process.terminate()
+            # Wait up to 1 second for graceful shutdown
+            try:
+                self.process.wait(timeout=1.0)
+                log.debug(f"{self.stream_name}: stream stopped gracefully")
+            except subprocess.TimeoutExpired:
+                # Force kill if it didn't terminate
+                log.debug(f"{self.stream_name}: forcing stream to stop")
+                self.process.kill()
+                self.process.wait()
+        except Exception as e:
+            log.debug(f"{self.stream_name}: error during shutdown: {e}")
 
     def start_server(self, file_name_initial_video: Union[str, Path]) -> None:
         log.debug(f"{self.stream_name}: starting server with {file_name_initial_video}")
