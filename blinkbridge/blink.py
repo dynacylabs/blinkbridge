@@ -1,13 +1,20 @@
+"""Blink camera integration and video clip management.
+
+Provides the CameraManager class for authenticating with Blink cameras,
+downloading video clips, and monitoring for motion detection events.
+"""
 import asyncio
-from collections import defaultdict
-from datetime import datetime, timedelta 
 import logging
-from typing import Dict, Tuple, Union
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict, Optional, Tuple, Union
+
 from aiohttp import ClientSession
-from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth, BlinkTwoFARequiredError, TokenRefreshFailed, LoginError
+from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
+
 from blinkbridge.config import *
 
 
@@ -15,85 +22,117 @@ log = logging.getLogger(__name__)
 
 
 def find_most_recent_clip_url(recent_clips: dict, date: str) -> str:
-    # sort data in reverse order by time
+    """Find the most recent non-snapshot clip URL that is newer than the given date.
+    
+    Args:
+        recent_clips: Dictionary of recent clips from Blink camera
+        date: ISO format date string to compare against
+        
+    Returns:
+        URL of the most recent clip, or empty string if none found
+        
+    Note:
+        Filters out snapshots (which contain '/snapshot/' in the URL) and only
+        returns actual video clips that are newer than the specified date.
+    """
     sorted_data = sorted(recent_clips, key=lambda x: x['time'], reverse=True)
 
-    # get the first entry that does not contain "/snapshot/"
-    for entry in sorted_data:
-        if '/snapshot/' not in entry['clip']:
-            break
-    else:
+    # Find first entry that is not a snapshot
+    clip_entry = next((entry for entry in sorted_data if '/snapshot/' not in entry['clip']), None)
+    if not clip_entry:
         return ''
     
-    # convert to datetime
+    # Check if entry is newer than the given date
     date = datetime.fromisoformat(date.replace('Z', '+00:00'))
-    entry_time = datetime.fromisoformat(entry['time'].replace('Z', '+00:00'))
-
-    # see if entry is newer than date
-    if entry_time > date:
-        return entry['clip']
+    entry_time = datetime.fromisoformat(clip_entry['time'].replace('Z', '+00:00'))
     
-    return '' 
+    return clip_entry['clip'] if entry_time > date else '' 
 
 class CameraManager:
-    def __init__(self):
-        self.session = ClientSession()
-        self.camera_last_record = defaultdict(lambda: None)
-        self.metadata = None
-        self.black_video_path = None
-        self.cameras_without_clips = set()  # Track cameras that currently don't have clips
-        self.cameras_ever_had_real_clip = set()  # Track cameras that have ever had a real clip (permanent within run)
+    """Manages Blink camera connections and video clip downloads.
+    
+    Handles authentication, metadata management, clip downloads, and motion detection
+    for Blink camera systems. Maintains state about which cameras have clips available
+    and provides black video placeholders for cameras without recorded content.
+    
+    Attributes:
+        session: aiohttp ClientSession for HTTP requests
+        blink: BlinkPy Blink instance
+        camera_last_record: Dict tracking last recorded event per camera
+        metadata: List of video metadata from Blink API
+        black_video_path: Path to black placeholder video
+        cameras_without_clips: Set of cameras currently without clips
+        cameras_ever_had_real_clip: Set of cameras that have had clips (persistent)
+    """
+    
+    def __init__(self) -> None:
+        self.session: ClientSession = ClientSession()
+        self.camera_last_record: Dict[str, Optional[str]] = defaultdict(lambda: None)
+        self.metadata: Optional[list] = None
+        self.black_video_path: Optional[Path] = None
+        self.cameras_without_clips: set = set()
+        self.cameras_ever_had_real_clip: set = set()
 
     async def _login(self) -> None:
-        """Login to Blink using OAuth v2 authentication."""
+        """Login to Blink using OAuth v2 authentication.
+        
+        Attempts to use saved credentials if available, otherwise performs
+        fresh authentication. Handles 2FA if required.
+        
+        Raises:
+            LoginError: If authentication fails
+            TokenRefreshFailed: If token refresh fails
+            
+        Note:
+            Credentials are saved to .cred.json in the config directory for reuse.
+        """
         self.blink = Blink(session=self.session)
         path_cred = PATH_CONFIG / ".cred.json"
 
-        if not path_cred.exists():
-            log.info("Logging into Blink with credentials from config")
-            # Create Auth with login credentials for initial OAuth v2 flow
-            self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
-        else:
+        if path_cred.exists():
             log.info("Logging into Blink with saved credentials")
-            # Load saved credentials (includes OAuth tokens, hardware_id, etc.)
             saved_data = await json_load(path_cred)
             self.blink.auth = Auth(saved_data, no_prompt=True, session=self.session)
+        else:
+            log.info("Logging into Blink with credentials from config")
+            self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
 
         try:
-            # Start the Blink system (performs OAuth v2 authentication)
             await self.blink.start()
             log.info("Successfully authenticated with Blink")
         except BlinkTwoFARequiredError:
-            # Prompt user for 2FA code
             log.info("Two-factor authentication required")
             twofa_code = input("Enter your 2FA code: ")
             
-            # Complete 2FA login
             success = await self.blink.send_2fa_code(twofa_code)
             if not success:
-                log.error("2FA verification failed")
                 raise LoginError("2FA verification failed")
             
             log.info("Successfully authenticated with Blink (2FA completed)")
         except (TokenRefreshFailed, LoginError) as e:
             log.error(f"Authentication failed: {e}")
-            # If we have saved creds that failed, remove them so we retry with fresh login
             if path_cred.exists():
                 log.info("Removing invalid saved credentials")
                 path_cred.unlink()
             raise
 
-        # Save credentials after successful authentication (includes OAuth tokens)
-        if not path_cred.exists():
-            log.info("Saving Blink credentials for future use")
-            await self.blink.save(path_cred)
-        else:
-            # Update saved credentials with refreshed tokens
-            log.debug("Updating saved credentials with refreshed tokens")
-            await self.blink.save(path_cred)
+        log.debug("Saving Blink credentials")
+        await self.blink.save(path_cred)
 
-    def _generate_black_video(self, width: int = 1920, height: int = 1080) -> Path:
-        """Generate a black video file to use as placeholder for cameras without clips."""
+    def _generate_black_video(self, width: int = 1920, height: int = 1080) -> Optional[Path]:
+        """Generate a black video file to use as placeholder for cameras without clips.
+        
+        Args:
+            width: Video width in pixels (default: 1920)
+            height: Video height in pixels (default: 1080)
+            
+        Returns:
+            Path to the generated black video file, or None if generation failed
+            
+        Note:
+            Uses FFmpeg to create a video with black frames and silent audio.
+            The duration matches CONFIG['still_video_duration'].
+        """
         import subprocess
         
         black_video_path = PATH_VIDEOS / "_black_placeholder.mp4"
@@ -103,24 +142,13 @@ class CameraManager:
             return black_video_path
         
         duration = CONFIG['still_video_duration']
-        
         ffmpeg_cmd = [
-            'ffmpeg',
-            *COMMON_FFMPEG_ARGS,
-            '-f', 'lavfi',
-            '-i', f'color=black:s={width}x{height}:d={duration}',
-            '-f', 'lavfi',
-            '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
-            '-c:v', 'libx264',
-            '-profile:v', 'high',
-            '-level:v', '4.1',
-            '-c:a', 'aac',
-            '-ar', '44100',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-t', str(duration),
-            '-pix_fmt', 'yuv420p',
-            '-movflags', 'faststart',
+            'ffmpeg', *COMMON_FFMPEG_ARGS,
+            '-f', 'lavfi', '-i', f'color=black:s={width}x{height}:d={duration}',
+            '-f', 'lavfi', '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
+            '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+            '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k',
+            '-t', str(duration), '-pix_fmt', 'yuv420p', '-movflags', 'faststart',
             str(black_video_path)
         ]
         
@@ -135,54 +163,64 @@ class CameraManager:
         return black_video_path
     
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
-        """Detect resolution from first available clip in metadata."""
-        for media in self.metadata:
-            if media.get('deleted') or media.get('source') == 'snapshot':
-                continue
-            # Attempt to extract resolution if available in metadata
-            # Blink typically uses 1920x1080 for most cameras
-            # We'll return a safe default
-            break
+        """Detect resolution from clips. Returns default Blink resolution (1920x1080).
         
-        # Default to common Blink resolution
+        Returns:
+            Tuple of (width, height) in pixels
+            
+        Note:
+            Currently returns hardcoded 1920x1080 as all Blink cameras use this resolution.
+            Could be extended to detect actual resolution from clip metadata.
+        """
         return (1920, 1080)
     
     async def refresh_metadata(self) -> None:
+        """Refresh video metadata from Blink API.
+        
+        Fetches recent video clips based on CONFIG['blink']['history_days'].
+        Updates self.metadata with the latest available clips.
+        """
         log.debug('refreshing video metadata')
         dt_past = datetime.now() - timedelta(days=CONFIG['blink']['history_days'])
         self.metadata = await self.blink.get_videos_metadata(since=str(dt_past), stop=2)
 
-    async def save_latest_clip(self, camera_name: str, force: bool=False, use_black_fallback: bool=True) -> Union[Path, None]:
-        '''
-        Download and save latest videos for camera.
-        If no clips available and use_black_fallback=True AND camera never had a real clip, returns path to black video.
-        Once a camera has had a real clip, it will never fall back to black screen.
-        ''' 
+    async def save_latest_clip(self, camera_name: str, force: bool=False, use_black_fallback: bool=True) -> Optional[Path]:
+        """Download and save latest clip for camera.
+        
+        Args:
+            camera_name: Name of the camera
+            force: Force re-download even if clip exists (default: False)
+            use_black_fallback: Use black video if no clips available, only for 
+                cameras that never had clips (default: True)
+        
+        Returns:
+            Path to the video file, or None if unavailable and no fallback
+            
+        Note:
+            Once a camera has had a real clip, it will never fall back to the
+            black placeholder video, even if new clips temporarily unavailable.
+        """
         camera_name_sanitized = camera_name.lower().replace(' ', '_')
         file_name = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
     
-        # don't download if clip already exists
         if file_name.exists() and not force:
             log.debug(f"{camera_name}: skipping download, {file_name} exists")
-            # If this is a cached real clip (not black video), mark as having had real clip
             if file_name != self.black_video_path:
                 self.cameras_without_clips.discard(camera_name)
                 self.cameras_ever_had_real_clip.add(camera_name)
             return file_name
 
-        # skip deleted clips and camera snapshots
         media = next((m for m in self.metadata if m['device_name'] == camera_name 
                     if not m['deleted'] and m['source'] != 'snapshot'), None)
 
         if media is None:
             log.warning(f"{camera_name}: no clips found for camera")
-            # Only use black fallback if camera has NEVER had a real clip
             if use_black_fallback and self.black_video_path and camera_name not in self.cameras_ever_had_real_clip:
                 log.info(f"{camera_name}: using black video placeholder (never had real clip)")
                 self.cameras_without_clips.add(camera_name)
                 return self.black_video_path
             elif camera_name in self.cameras_ever_had_real_clip:
-                log.warning(f"{camera_name}: no new clips found, but camera has had real clips before - not falling back to black")
+                log.warning(f"{camera_name}: no new clips found, but camera has had real clips before")
             return None
 
         try:
@@ -193,7 +231,6 @@ class CameraManager:
             with open(file_name, 'wb') as f:
                 f.write(await response.read())
             
-            # Camera has a real clip now (mark permanently)
             self.cameras_without_clips.discard(camera_name)
             self.cameras_ever_had_real_clip.add(camera_name)
             log.debug(f"{camera_name}: successfully downloaded real clip")
@@ -206,7 +243,27 @@ class CameraManager:
                 return file_name
             return None
     
+    def _mark_camera_has_clip(self, camera_name: str) -> None:
+        """Mark that a camera has a real clip.
+        
+        Args:
+            camera_name: Name of the camera
+            
+        Note:
+            This is a permanent state change - once marked, the camera will
+            never fall back to black placeholder video.
+        """
+        self.cameras_without_clips.discard(camera_name)
+        self.cameras_ever_had_real_clip.add(camera_name)
+    
     async def _save_clip(self, camera_name: str, url: str, file_name: Path) -> None:
+        """Save a video clip from URL to file.
+        
+        Args:
+            camera_name: Name of the camera
+            url: URL of the video clip to download
+            file_name: Path where the clip should be saved
+        """
         camera = self.blink.cameras[camera_name]
         response = await camera.get_video_clip(url)
 
@@ -214,10 +271,19 @@ class CameraManager:
         with open(file_name, 'wb') as f:
             f.write(await response.read())
     
-    async def check_for_motion(self, camera_name: str) -> Union[Path, None]:
-        '''
-        Check if a camera has been motion detected
-        '''
+    async def check_for_motion(self, camera_name: str) -> Optional[Path]:
+        """Check if camera detected motion and download new clip if available.
+        
+        Args:
+            camera_name: Name of the camera to check
+            
+        Returns:
+            Path to the downloaded clip file, or None if no new motion detected
+            
+        Note:
+            Handles both regular video clips and snapshot events. For snapshots,
+            searches for the most recent actual clip in the recent_clips list.
+        """
         await self.blink.refresh()
         camera = self.blink.cameras[camera_name]
 
@@ -238,38 +304,46 @@ class CameraManager:
         camera_name_sanitized = camera_name.lower().replace(' ', '_')
         file_name = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
 
-        # HACK: detect snapshot events and see if there is a recent clip in them
+        # Handle snapshot events by finding recent clip
         if '/snapshot/' in camera.attributes['video']:
             if url := find_most_recent_clip_url(camera.attributes['recent_clips'], camera.attributes['last_record']):
                 log.debug(f"{camera_name}: found recent clip in snapshot, saving to {file_name}")
                 await self._save_clip(camera_name, url, file_name)
-                self.camera_last_record[camera_name] = camera.attributes['last_record']
-                # Mark as having real clip
-                self.cameras_without_clips.discard(camera_name)
-                self.cameras_ever_had_real_clip.add(camera_name)
+                self._mark_camera_has_clip(camera_name)
+                self.camera_last_record[camera_name] = last_record
                 log.info(f"{camera_name}: clip downloaded and saved to {file_name}")
-            
                 return file_name
 
             log.debug(f"{camera_name}: no recent clip in snapshot, skipping")
-            self.camera_last_record[camera_name] = camera.attributes['last_record']
-
+            self.camera_last_record[camera_name] = last_record
             return None
         
         log.debug(f"{camera_name}: downloading clip to {file_name}")
         await camera.video_to_file(file_name)
-        self.camera_last_record[camera_name] = camera.attributes['last_record']
-        # Mark as having real clip
-        self.cameras_without_clips.discard(camera_name)
-        self.cameras_ever_had_real_clip.add(camera_name)
+        self._mark_camera_has_clip(camera_name)
+        self.camera_last_record[camera_name] = last_record
         log.info(f"{camera_name}: clip downloaded and saved to {file_name}")
 
         return file_name
         
     def get_cameras(self) -> iter:
+        """Get iterator of all available camera names.
+        
+        Returns:
+            Iterator of camera name strings
+        """
         return self.blink.cameras.keys()
     
     async def start(self) -> None:
+        """Initialize the camera manager.
+        
+        Performs authentication, refreshes metadata, and generates the black
+        video placeholder for cameras without clips.
+        
+        Raises:
+            LoginError: If authentication fails
+            TokenRefreshFailed: If token refresh fails
+        """
         await self._login()
         await self.refresh_metadata()
         
@@ -280,26 +354,11 @@ class CameraManager:
             log.warning("Failed to create black video placeholder, cameras without clips will be skipped")
     
     async def close(self) -> None:
-        """Properly close all connections and clean up resources."""
-        # Close the session only once (blink.auth.session is the same as self.session)
-        if hasattr(self, 'session') and self.session is not None:
-            if not self.session.closed:
-                await self.session.close()
-                # Give the event loop time to clean up SSL transports
-                # This prevents "Unclosed connector" warnings
-                await asyncio.sleep(0.25)
-
-async def test() -> None:
-    cm = CameraManager()
-
-    await cm.start()
-
-    for camera in cm.get_cameras():
-        file_name = await cm.check_for_motion(camera)
-
-        print(file_name)
-
-    await cm.close()
-
-if __name__ == "__main__":
-    asyncio.run(test())
+        """Properly close all connections and clean up resources.
+        
+        Closes the aiohttp session and waits briefly for SSL cleanup.
+        """
+        if hasattr(self, 'session') and self.session is not None and not self.session.closed:
+            await self.session.close()
+            # Give the event loop time to clean up SSL transports
+            await asyncio.sleep(0.25)

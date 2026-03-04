@@ -31,7 +31,6 @@ Once the RTSP streams are available, you can use them in applications such as [F
 # TODO
 
 - [ ] Better error handling
-- [ ] Cleanup code
 - [ ] Support FFmpeg hardware acceleration (e.g. QSV)
 - [ ] Process cameras in parallel and reduce latency
 - [ ] Add ONVIF server with motion events
