@@ -66,7 +66,6 @@ class Application:
         if redownload:
             await self.cam_manager.refresh_metadata()
 
-        log.debug(f"{camera_name}: getting latest clip")
         file_name_initial_video = await self.cam_manager.save_latest_clip(camera_name, force=redownload)
 
         if file_name_initial_video is None:
@@ -99,19 +98,27 @@ class Application:
         Returns:
             True if motion was detected and clip added, False otherwise
         """
-        ss = self.stream_servers[camera_name]
+        try:
+            ss = self.stream_servers.get(camera_name)
+            if not ss:
+                log.warning(f"{camera_name}: stream server not found")
+                return False
 
-        if not ss.is_running():
+            if not ss.is_running():
+                log.debug(f"{camera_name}: stream server not running")
+                return False
+            
+            file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
+
+            if not file_name_new_clip:
+                return False
+
+            log.debug(f"{ss.stream_name}: adding new clip to stream")
+            ss.add_video(file_name_new_clip)
+            return True
+        except Exception as e:
+            log.error(f"{camera_name}: error in check_for_motion: {e}", exc_info=True)
             return False
-        
-        file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
-
-        if not file_name_new_clip:
-            return False
-
-        log.info(f"{ss.stream_name}: adding new clip to stream")
-        ss.add_video(file_name_new_clip)
-        return True
     
     async def check_for_first_clip(self, camera_name: str) -> bool:
         """Check if a camera without clips now has its first clip available.
@@ -126,22 +133,27 @@ class Application:
             Only checks cameras that are in cameras_without_clips set.
             Once a clip is found, upgrades the stream from black placeholder.
         """
-        if camera_name not in self.cam_manager.cameras_without_clips:
+        try:
+            if camera_name not in self.cam_manager.cameras_without_clips:
+                return False
+            
+            ss = self.stream_servers.get(camera_name)
+            if not ss or not ss.is_running():
+                log.debug(f"{camera_name}: stream not running when checking for first clip")
+                return False
+            
+            await self.cam_manager.refresh_metadata()
+            file_name = await self.cam_manager.save_latest_clip(camera_name, force=True, use_black_fallback=False)
+            
+            if file_name:
+                log.info(f"{camera_name}: first clip now available, upgrading from black placeholder")
+                ss.add_video(file_name)
+                return True
+            
             return False
-        
-        ss = self.stream_servers.get(camera_name)
-        if not ss or not ss.is_running():
+        except Exception as e:
+            log.error(f"{camera_name}: error checking for first clip: {e}", exc_info=True)
             return False
-        
-        await self.cam_manager.refresh_metadata()
-        file_name = await self.cam_manager.save_latest_clip(camera_name, force=True, use_black_fallback=False)
-        
-        if file_name:
-            log.info(f"{camera_name}: first clip now available, upgrading from black placeholder")
-            ss.add_video(file_name)
-            return True
-        
-        return False
         
     async def start(self) -> None:
         """Start the application, initialize cameras, and begin monitoring.
@@ -149,18 +161,35 @@ class Application:
         Raises:
             LoginError: If Blink authentication fails
             TokenRefreshFailed: If Blink token refresh fails
+            Exception: For other critical initialization errors
         """
-        self.running = True
-        self.cam_manager = CameraManager()
-        await self.cam_manager.start()
+        try:
+            self.running = True
+            self.cam_manager = CameraManager()
+            await self.cam_manager.start()
+        except Exception as e:
+            log.error(f"Failed to initialize camera manager: {e}")
+            raise
 
-        enabled_cameras = self._get_enabled_cameras()
-        log.info(f"enabled cameras: {enabled_cameras}")
+        try:
+            enabled_cameras = self._get_enabled_cameras()
+            log.info(f"enabled cameras: {enabled_cameras}")
+        except Exception as e:
+            log.error(f"Failed to get enabled cameras: {e}")
+            raise
 
-        await self._initialize_camera_streams(enabled_cameras)
+        try:
+            await self._initialize_camera_streams(enabled_cameras)
+        except Exception as e:
+            log.error(f"Error during camera stream initialization: {e}")
+            # Continue even if some streams fail to initialize
         
         if self.running:
-            await self._monitor_cameras()
+            try:
+                await self._monitor_cameras()
+            except Exception as e:
+                log.error(f"Error in camera monitoring loop: {e}")
+                raise
     
     def _get_enabled_cameras(self) -> set:
         """Get the set of enabled cameras from config.
@@ -249,7 +278,7 @@ class Application:
         """
         active_cams = len(self.stream_servers) - len(self.cam_manager.cameras_without_clips)
         waiting_cams = len(self.cam_manager.cameras_without_clips)
-        log.info(
+        log.debug(
             f"Poll #{poll_count}: {active_cams} cameras active, "
             f"{waiting_cams} waiting for first clip"
         )
@@ -271,8 +300,13 @@ class Application:
                 else:
                     await self.check_for_motion(camera_name)
             except Exception as e:
-                log.error(f"{camera_name}: error checking for motion: {e}")
-                self.stream_servers[camera_name].close()
+                log.error(f"{camera_name}: critical error checking for updates: {e}", exc_info=True)
+                try:
+                    ss = self.stream_servers.get(camera_name)
+                    if ss:
+                        ss.close()
+                except Exception as close_err:
+                    log.error(f"{camera_name}: error closing stream after update failure: {close_err}")
     
     async def _restart_failed_streams(self) -> None:
         """Restart any failed stream servers.
@@ -284,29 +318,37 @@ class Application:
         for camera_name in list(self.stream_servers.keys()):
             if not self.running:
                 break
+            
+            try:
+                ss = self.stream_servers[camera_name]
+                if ss.is_running():
+                    continue
                 
-            ss = self.stream_servers[camera_name]
-            if ss.is_running():
-                continue
-            
-            if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
-                log.warning(f"{camera_name}: too many failures, disabling")
-                self.stream_servers.pop(camera_name)
-                continue
+                if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
+                    log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
+                    try:
+                        self.stream_servers.pop(camera_name)
+                    except KeyError:
+                        log.debug(f"{camera_name}: already removed from stream servers")
+                    continue
 
-            log.warning(f"{camera_name}: server failed {ss.failure_count + 1} time(s)")
+                log.warning(f"{camera_name}: server failed {ss.failure_count + 1} time(s)")
 
-            if datetime.now() < ss.datetime_started + DELAY_RESTART:
-                continue
+                if datetime.now() < ss.datetime_started + DELAY_RESTART:
+                    log.debug(f"{camera_name}: waiting for restart delay to elapse")
+                    continue
 
-            ss_new = await self.start_stream(camera_name, redownload=True)
-            if ss_new is None:
-                log.debug(f"{camera_name}: still no clips available, will retry later")
-                ss.datetime_started = datetime.now()
-                continue
-            
-            ss_new.failure_count = ss.failure_count + 1
-            ss_new.datetime_started = datetime.now()
+                ss_new = await self.start_stream(camera_name, redownload=True)
+                if ss_new is None:
+                    log.debug(f"{camera_name}: restart failed, will retry later")
+                    ss.datetime_started = datetime.now()
+                    continue
+                
+                ss_new.failure_count = ss.failure_count + 1
+                ss_new.datetime_started = datetime.now()
+                log.info(f"{camera_name}: stream restarted successfully")
+            except Exception as e:
+                log.error(f"{camera_name}: error during stream restart: {e}", exc_info=True)
 
     async def close(self) -> None:
         """Close the application and stop all streams.
@@ -349,9 +391,13 @@ async def main() -> None:
         app.running = False
         shutdown_event.set()
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_exit)
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_exit)
+    except Exception as e:
+        log.error(f"Failed to set up signal handlers: {e}")
+        raise
 
     try:
         start_task = asyncio.create_task(app.start())
@@ -362,11 +408,18 @@ async def main() -> None:
             await start_task
         except asyncio.CancelledError:
             log.debug("Start task cancelled successfully")
+        except Exception as e:
+            log.error(f"Error in start task: {e}", exc_info=True)
 
+    except KeyboardInterrupt:
+        log.info("Keyboard interrupt received")
     except Exception as e:
-        log.error(f"Unexpected error: {e}")
+        log.error(f"Unexpected error in main: {e}", exc_info=True)
     finally:
-        await app.close()
+        try:
+            await app.close()
+        except Exception as e:
+            log.error(f"Error during application cleanup: {e}", exc_info=True)
 
 if __name__ == "__main__":
     logging.basicConfig(

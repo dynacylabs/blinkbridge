@@ -3,9 +3,13 @@
 Provides functions to interact with Linux /proc filesystem for monitoring
 process file descriptors and waiting for specific file operations.
 """
+import logging
 import time
 from pathlib import Path
 from typing import List, Union
+
+
+log = logging.getLogger(__name__)
 
 
 def get_pids_by_name(process_name: str) -> List[int]:
@@ -25,19 +29,42 @@ def get_pids_by_name(process_name: str) -> List[int]:
         [1234, 5678]
     """
     pids = []
+    
+    try:
+        proc_path = Path('/proc')
+        if not proc_path.exists():
+            log.error("/proc filesystem not available")
+            return pids
+    except Exception as e:
+        log.error(f"Error accessing /proc: {e}")
+        return pids
 
-    for pid_dir in Path('/proc').iterdir():
-        if not (pid_dir.is_dir() and pid_dir.name.isdigit()):
-            continue
-            
-        try:
-            with open(pid_dir / 'comm', 'r') as f:
-                comm = f.read().strip()
-                if comm == process_name:
-                    pids.append(int(pid_dir.name))
-        except FileNotFoundError:
-            # Process may have terminated between directory listing and file read
-            continue
+    try:
+        for pid_dir in proc_path.iterdir():
+            try:
+                if not (pid_dir.is_dir() and pid_dir.name.isdigit()):
+                    continue
+            except (OSError, PermissionError):
+                continue
+                
+            try:
+                comm_file = pid_dir / 'comm'
+                with open(comm_file, 'r') as f:
+                    comm = f.read().strip()
+                    if comm == process_name:
+                        pids.append(int(pid_dir.name))
+            except FileNotFoundError:
+                # Process may have terminated between directory listing and file read
+                continue
+            except PermissionError:
+                # No permission to read this process
+                continue
+            except (ValueError, OSError) as e:
+                # Invalid PID or other OS error
+                log.debug(f"Error reading process {pid_dir.name}: {e}")
+                continue
+    except Exception as e:
+        log.error(f"Error scanning /proc directory: {e}")
 
     return pids
 
@@ -58,17 +85,36 @@ def get_open_files(pid: int) -> List[Path]:
         This function resolves those links to get the real paths.
     """
     file_names = []
-    fd_dir = Path(f'/proc/{pid}/fd')
+    
+    try:
+        fd_dir = Path(f'/proc/{pid}/fd')
 
-    if not fd_dir.is_dir():
+        if not fd_dir.exists() or not fd_dir.is_dir():
+            log.debug(f"Process {pid} not found or fd directory not accessible")
+            return file_names
+    except OSError as e:
+        log.debug(f"Error accessing /proc/{pid}/fd: {e}")
         return file_names
     
-    for fd in fd_dir.iterdir():
-        try:
-            file_names.append(fd.resolve())
-        except (FileNotFoundError, PermissionError):
-            # FD may have been closed or we lack permission to read it
-            continue
+    try:
+        for fd in fd_dir.iterdir():
+            try:
+                resolved_path = fd.resolve()
+                file_names.append(resolved_path)
+            except FileNotFoundError:
+                # FD may have been closed between listing and resolving
+                continue
+            except PermissionError:
+                # No permission to read this FD
+                continue
+            except (OSError, RuntimeError) as e:
+                # Other errors (e.g., broken symlink, too many levels)
+                log.debug(f"Error resolving fd {fd}: {e}")
+                continue
+    except PermissionError:
+        log.debug(f"No permission to list open files for process {pid}")
+    except OSError as e:
+        log.debug(f"Error listing open files for process {pid}: {e}")
         
     return file_names
  
@@ -88,13 +134,26 @@ def is_file_open(process_name: str, file_name: Union[str, Path]) -> bool:
         >>> is_file_open('ffmpeg', '/tmp/video.mp4')
         True
     """
-    file_name = Path(file_name).resolve()
-    pids = get_pids_by_name(process_name)
+    try:
+        file_name = Path(file_name).resolve()
+    except (OSError, RuntimeError) as e:
+        log.error(f"Error resolving file path {file_name}: {e}")
+        return False
+    
+    try:
+        pids = get_pids_by_name(process_name)
+    except Exception as e:
+        log.error(f"Error getting PIDs for process {process_name}: {e}")
+        return False
 
     for pid in pids:
-        open_files = get_open_files(pid)
-        if file_name in open_files:
-            return True
+        try:
+            open_files = get_open_files(pid)
+            if file_name in open_files:
+                return True
+        except Exception as e:
+            log.debug(f"Error checking open files for PID {pid}: {e}")
+            continue
                 
     return False
 
@@ -115,21 +174,42 @@ def wait_until_file_open(file_path: Union[str, Path], pid: int, timeout: float=1
         
     Raises:
         TimeoutError: If timeout is reached before file is opened by the process.
+        ValueError: If timeout or poll_interval are invalid
         
     Example:
         >>> elapsed = wait_until_file_open('/tmp/video.mp4', 1234, timeout=5.0)
         >>> print(f"File opened after {elapsed:.2f} seconds")
         File opened after 0.47 seconds
     """
-    file_path = Path(file_path).resolve()
+    if timeout <= 0:
+        raise ValueError(f"Invalid timeout: {timeout} (must be > 0)")
+    if poll_interval <= 0:
+        raise ValueError(f"Invalid poll_interval: {poll_interval} (must be > 0)")
+    
+    try:
+        file_path = Path(file_path).resolve()
+    except (OSError, RuntimeError) as e:
+        log.error(f"Error resolving file path {file_path}: {e}")
+        raise ValueError(f"Invalid file path: {e}")
+    
     start_time = time.time()
 
     while time.time() - start_time <= timeout:
-        open_files = get_open_files(pid)
-        
-        if file_path in open_files:
-            return time.time() - start_time
+        try:
+            open_files = get_open_files(pid)
+            
+            if file_path in open_files:
+                elapsed = time.time() - start_time
+                log.debug(f"File {file_path} opened by process {pid} after {elapsed:.2f}s")
+                return elapsed
+        except Exception as e:
+            log.debug(f"Error checking if file is open (will retry): {e}")
 
-        time.sleep(poll_interval)
+        try:
+            time.sleep(poll_interval)
+        except Exception as e:
+            log.error(f"Error during sleep: {e}")
+            break
 
+    log.error(f"Timeout waiting for process {pid} to open {file_path} after {timeout}s")
     raise TimeoutError(f"Timeout waiting for process {pid} to open {file_path}")
