@@ -20,6 +20,11 @@ class Application:
         self.running = False
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> StreamServer:
+        # Check if shutdown has been requested
+        if not self.running:
+            log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
+            return None
+            
         if redownload:
             await self.cam_manager.refresh_metadata()
 
@@ -29,6 +34,11 @@ class Application:
         # All cameras get a stream now (either real clip or black video placeholder)
         if file_name_initial_video is None:
             log.error(f"{camera_name}: cannot start stream (no video available)")
+            return None
+
+        # Check again after async operations
+        if not self.running:
+            log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
             return None
 
         if camera_name in self.cam_manager.cameras_without_clips:
@@ -94,6 +104,10 @@ class Application:
 
         # create stream servers for each camera
         for camera in self.cam_manager.get_cameras():
+            if not self.running:  # Check if shutdown initiated
+                log.info("Shutdown requested during startup, stopping stream creation")
+                break
+                
             if camera not in enabled_cameras:
                 continue
             
@@ -104,6 +118,9 @@ class Application:
             
             ss.failure_count = 0
             ss.datetime_started = datetime.now()
+            
+            # Small yield to allow signal handlers to run
+            await asyncio.sleep(0)
 
         log.info(f"monitoring cameras for motion (poll interval: {CONFIG['blink']['poll_interval']}s)")
         
@@ -136,7 +153,9 @@ class Application:
                 last_log_time = datetime.now()
             
             # check for motion on cameras that have clips
-            for camera_name in self.stream_servers:
+            for camera_name in list(self.stream_servers.keys()):
+                if not self.running:  # Exit early if shutdown requested
+                    break
                 try:
                     # For cameras without clips, check if they now have their first clip
                     if camera_name in self.cam_manager.cameras_without_clips:
@@ -151,6 +170,9 @@ class Application:
 
             # check if any stream servers are stopped and restart them
             for camera_name in list(self.stream_servers.keys()):
+                if not self.running:  # Exit early if shutdown requested
+                    break
+                    
                 ss = self.stream_servers[camera_name]
 
                 if not ss.is_running():
@@ -180,13 +202,29 @@ class Application:
             await asyncio.sleep(CONFIG['blink']['poll_interval'])
 
     async def close(self) -> None:
+        log.info("Closing application and stopping all streams...")
+        log.info("Note: FFmpeg 'Broken pipe' errors during shutdown are normal if mediamtx stops first")
         self.running = False
 
-        if self.cam_manager:
-            await self.cam_manager.close()
+        # Close all stream servers first
+        for camera_name, ss in list(self.stream_servers.items()):
+            try:
+                log.debug(f"{camera_name}: stopping stream")
+                ss.close()
+            except Exception as e:
+                log.warning(f"{camera_name}: error stopping stream: {e}")
         
-        for ss in self.stream_servers.values():
-            ss.close()
+        # Give ffmpeg processes a moment to exit cleanly
+        await asyncio.sleep(0.2)
+        
+        # Close camera manager
+        if self.cam_manager:
+            try:
+                await self.cam_manager.close()
+            except Exception as e:
+                log.warning(f"Error closing camera manager: {e}")
+        
+        log.info("Application closed")
 
 async def main() -> None:
     app = Application()
@@ -196,6 +234,8 @@ async def main() -> None:
 
     def handle_exit():
         # Signal the shutdown event when Ctrl+C is received
+        log.info("Shutdown signal received...")
+        app.running = False  # Stop immediately
         shutdown_event.set()
 
     # Add signal handlers using loop.add_signal_handler
@@ -209,15 +249,13 @@ async def main() -> None:
         
         # Wait for shutdown signal
         await shutdown_event.wait()
-
-        log.info("Shutting down...")
         
         # Cancel the start task and wait for it to complete
         start_task.cancel()
         try:
             await start_task
         except asyncio.CancelledError:
-            pass
+            log.debug("Start task cancelled successfully")
 
     except Exception as e:
         log.error(f"Unexpected error: {e}")
