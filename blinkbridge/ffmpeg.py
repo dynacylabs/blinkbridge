@@ -35,6 +35,11 @@ class StreamParameters:
 
         stream_audio = next((s for s in js if s['codec_name'] == 'aac'), {})
         stream_video = next((s for s in js if s['codec_name'] == 'h264'), {})
+        
+        if not stream_audio:
+            log.warning(f"No AAC audio stream found in video. Available codecs: {[s.get('codec_name') for s in js]}")
+        if not stream_video:
+            log.warning(f"No H264 video stream found in video. Available codecs: {[s.get('codec_name') for s in js]}")
 
         return stream_audio, stream_video
 
@@ -72,6 +77,15 @@ class FrameToVideo:
         time_base_denominator = params_video['time_base'].split('/')[1] # cut off "1/"
         fps_value = params_video['r_frame_rate']
         
+        # Use provided audio params or default to stereo 44.1kHz if no audio stream
+        if params_audio:
+            audio_channels = params_audio['channels']
+            audio_sample_rate = params_audio['sample_rate']
+        else:
+            log.info("No audio stream in source, generating silent audio track")
+            audio_channels = '2'
+            audio_sample_rate = '44100'
+        
         # Create the ffmpeg parameters list
         ffmpeg_params = [
             'ffmpeg',
@@ -79,7 +93,7 @@ class FrameToVideo:
             '-loop', '1',
             '-i', image_file_name,   
             '-f', 'lavfi',
-            '-i', f"anullsrc=channel_layout={params_audio['channels']}:sample_rate={params_audio['sample_rate']}",
+            '-i', f"anullsrc=channel_layout={audio_channels}:sample_rate={audio_sample_rate}",
             '-c:v', params_video['codec_name'],
             '-pix_fmt', params_video['pix_fmt'],
             '-t', str(output_duration),
@@ -91,8 +105,8 @@ class FrameToVideo:
             '-video_track_timescale', time_base_denominator,
             '-fps_mode', 'passthrough',
             '-c:a', 'aac',
-            '-ar', params_audio['sample_rate'],
-            '-ac', params_audio['channels'],
+            '-ar', audio_sample_rate,
+            '-ac', audio_channels,
             file_name_output_video
         ]    
 
@@ -110,6 +124,7 @@ class StillVideoCreator:
                  file_name_input_video: Union[str, Path], 
                  output_duration: float=1, 
                  file_name_still_video: Union[str, Path]="output.mp4"):
+        self.exception = None
         self.thread = threading.Thread(target=self._run, 
                                        args=(file_name_input_video, output_duration, file_name_still_video))
         self.thread.start() 
@@ -118,21 +133,34 @@ class StillVideoCreator:
              file_name_input_video: Union[str, Path], 
              output_duration: float=1, 
              file_name_still_video: Union[str, Path]="output.mp4") -> None:
-        still_image_file_name = PATH_VIDEOS / 'last_frame.jpg'
-        lfg = VideoToLastFrame(file_name_input_video, still_image_file_name) # run in background
-        params_audio, params_video = StreamParameters(file_name_input_video).wait()
-        lfg.wait()
+        try:
+            still_image_file_name = PATH_VIDEOS / 'last_frame.jpg'
+            lfg = VideoToLastFrame(file_name_input_video, still_image_file_name) # run in background
+            params_audio, params_video = StreamParameters(file_name_input_video).wait()
+            lfg.wait()
 
-        assert all((params_audio, params_video))
+            # Video stream is required, audio is optional
+            if not params_video:
+                error_msg = f"Failed to extract video stream (H264) from {file_name_input_video}. "
+                log.error(error_msg)
+                raise ValueError(error_msg)
+            
+            if not params_audio:
+                log.warning(f"No audio stream (AAC) found in {file_name_input_video}, will generate silent audio")
 
-        # convert to video
-        FrameToVideo(still_image_file_name, params_video, params_audio,
-                    output_duration=output_duration,
-                    file_name_output_video=file_name_still_video).wait()
-        
-        # remove temporary file
-        still_image_file_name.unlink()
+            # convert to video
+            FrameToVideo(still_image_file_name, params_video, params_audio,
+                        output_duration=output_duration,
+                        file_name_output_video=file_name_still_video).wait()
+            
+            # remove temporary file
+            still_image_file_name.unlink()
+        except Exception as e:
+            log.error(f"Error in StillVideoCreator: {e}")
+            self.exception = e
         
     def wait(self) -> None:
         self.thread.join()
+        if self.exception:
+            raise self.exception
     
