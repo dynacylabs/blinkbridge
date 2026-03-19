@@ -13,8 +13,8 @@
     },
     "blink": {
       "login": {
-        "username": "EMAIL_ADDRESS_HERE",
-        "password": "PASSWORD_HERE"
+        "username": "",
+        "password": ""
       },
       "history_days": 90,
       "poll_interval": 1
