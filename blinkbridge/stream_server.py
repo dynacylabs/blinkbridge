@@ -48,6 +48,10 @@ class StreamServer:
         Returns:
             RTSP URL where the stream is available
             
+        Raises:
+            FileNotFoundError: If FFmpeg is not found
+            Exception: If subprocess creation fails
+            
         Note:
             FFmpeg reads from a concat file that loops infinitely (-stream_loop -1).
             The concat file itself references another concat file that can be
@@ -55,6 +59,9 @@ class StreamServer:
         """
         output_url = f"{RTSP_URL}/{self.stream_name_sanitized}"
         input_concat_file = PATH_CONCAT / f"{self.stream_name_sanitized}.concat"
+
+        if not input_concat_file.exists():
+            raise FileNotFoundError(f"Concat file not found: {input_concat_file}")
 
         ffmpeg_args = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
@@ -70,7 +77,16 @@ class StreamServer:
             output_url
         ]
         
-        self.process = subprocess.Popen(ffmpeg_args, stdout=sys.stdout, stderr=sys.stderr)
+        try:
+            self.process = subprocess.Popen(ffmpeg_args, stdout=sys.stdout, stderr=sys.stderr)
+            log.debug(f"{self.stream_name}: FFmpeg process started (PID: {self.process.pid})")
+        except FileNotFoundError:
+            log.error(f"{self.stream_name}: FFmpeg not found. Please ensure FFmpeg is installed and in PATH")
+            raise
+        except Exception as e:
+            log.error(f"{self.stream_name}: failed to start FFmpeg process: {e}")
+            raise
+            
         return output_url
 
     def _make_concat_files(self) -> Path:
@@ -79,6 +95,9 @@ class StreamServer:
         Returns:
             Path to the created main concat file
             
+        Raises:
+            IOError: If file creation fails
+            
         Note:
             Creates a two-level concat structure:
             - Main concat file: loops and references next.concat
@@ -86,17 +105,25 @@ class StreamServer:
             
             The 'safe 0' option is propagated to allow absolute paths.
         """
-        log.debug(f"{self.stream_name}: making concat file")
-
         next_concat = PATH_CONCAT / f"{self.stream_name_sanitized}_next.concat"
         concat_file = PATH_CONCAT / f"{self.stream_name_sanitized}.concat"
 
-        with open(concat_file, 'w') as f:
-            f.write("ffconcat version 1.0\n")
-            # Reference next concat file twice for seamless looping
-            for _ in range(2):
-                f.write(f"file '{next_concat.resolve()}'\n")
-                f.write("option safe 0\n")  # Allow absolute paths
+        try:
+            # Ensure directory exists
+            PATH_CONCAT.mkdir(parents=True, exist_ok=True)
+            
+            with open(concat_file, 'w') as f:
+                f.write("ffconcat version 1.0\n")
+                # Reference next concat file twice for seamless looping
+                for _ in range(2):
+                    f.write(f"file '{next_concat.resolve()}'\n")
+                    f.write("option safe 0\n")  # Allow absolute paths
+        except IOError as e:
+            log.error(f"{self.stream_name}: failed to create concat file: {e}")
+            raise
+        except Exception as e:
+            log.error(f"{self.stream_name}: unexpected error creating concat file: {e}")
+            raise
 
         return concat_file
 
@@ -109,18 +136,36 @@ class StreamServer:
         Returns:
             Path to the updated next concat file
             
+        Raises:
+            FileNotFoundError: If video file doesn't exist
+            IOError: If concat file cannot be written
+            
         Note:
             Overwrites the next concat file with the new video. FFmpeg's concat
             demuxer will automatically switch to the new file when it loops.
         """
-        log.debug(f"{self.stream_name}: enqueueing {video_file_name}")
-
         video_file_name = Path(video_file_name)
+        
+        # Verify video file exists
+        try:
+            if not video_file_name.exists():
+                raise FileNotFoundError(f"Video file not found: {video_file_name}")
+        except OSError as e:
+            log.error(f"{self.stream_name}: error checking video file: {e}")
+            raise
+        
         next_concat = PATH_CONCAT / f"{self.stream_name_sanitized}_next.concat"
 
-        with open(next_concat, 'w') as f:
-            f.write("ffconcat version 1.0\n")
-            f.write(f"file '{video_file_name.resolve()}'\n")
+        try:
+            with open(next_concat, 'w') as f:
+                f.write("ffconcat version 1.0\n")
+                f.write(f"file '{video_file_name.resolve()}'\n")
+        except IOError as e:
+            log.error(f"{self.stream_name}: failed to write next concat file: {e}")
+            raise
+        except Exception as e:
+            log.error(f"{self.stream_name}: unexpected error enqueueing clip: {e}")
+            raise
 
         return next_concat
 
@@ -145,15 +190,29 @@ class StreamServer:
             5. Enqueue still video
             6. Delete previous still video
         """
-        if not still_only:
-            self._enqueue_clip(file_name_input_video)
+        try:
+            file_name_input_video = Path(file_name_input_video)
+            
+            # Verify input video exists
+            if not file_name_input_video.exists():
+                raise FileNotFoundError(f"Input video not found: {file_name_input_video}")
+                
+            if not still_only:
+                self._enqueue_clip(file_name_input_video)
+        except FileNotFoundError as e:
+            log.error(f"{self.stream_name}: {e}")
+            raise
+        except Exception as e:
+            log.error(f"{self.stream_name}: error enqueueing video: {e}")
+            raise
 
         # Create timestamped filename for still video
         dt = datetime.now()
         next_still_video = PATH_VIDEOS / f"{self.stream_name_sanitized}_still_{dt.strftime('%Y-%m-%d_%H-%M-%S-%f')}.mp4"
-
-        log.debug(f"{self.stream_name}: creating still video {next_still_video}")
         try:
+            # Ensure videos directory exists
+            PATH_VIDEOS.mkdir(parents=True, exist_ok=True)
+            
             svc = StillVideoCreator(
                 file_name_input_video,
                 output_duration=CONFIG['still_video_duration'],
@@ -162,25 +221,45 @@ class StreamServer:
             
             if not still_only:
                 log.debug(f"{self.stream_name}: waiting for new video to start")
-                wait_until_file_open(file_name_input_video, self.process.pid)
+                try:
+                    if self.process is None:
+                        log.warning(f"{self.stream_name}: process not started, cannot wait for video to open")
+                    else:
+                        wait_until_file_open(file_name_input_video, self.process.pid)
+                except TimeoutError as e:
+                    log.warning(f"{self.stream_name}: timeout waiting for video to open: {e}")
+                    # Continue anyway - video might still work
+                except Exception as e:
+                    log.warning(f"{self.stream_name}: error waiting for video to open: {e}")
             
             log.debug(f'{self.stream_name}: waiting for still video creation to finish')
             svc.wait()
             
             if not next_still_video.exists():
                 raise FileNotFoundError(f"Still video was not created: {next_still_video}")
+            
+            if next_still_video.stat().st_size == 0:
+                raise ValueError(f"Still video is empty: {next_still_video}")
                 
             self._enqueue_clip(next_still_video)
 
             if self.current_still_video and not still_only:
-                log.debug(f'{self.stream_name}: deleting old still video {self.current_still_video}')
-                self.current_still_video.unlink()
+                try:
+                    pass  # Delete old still video silently
+                    self.current_still_video.unlink()
+                except OSError as e:
+                    log.warning(f"{self.stream_name}: failed to delete old still video: {e}")
+                except Exception as e:
+                    log.warning(f"{self.stream_name}: unexpected error deleting old still video: {e}")
             
             self.current_still_video = next_still_video
         except Exception as e:
-            log.error(f"{self.stream_name}: Failed to create still video: {e}")
-            if next_still_video.exists():
-                next_still_video.unlink()
+            log.error(f"{self.stream_name}: Failed to create still video from {video_file}: {e}", exc_info=True)
+            try:
+                if next_still_video.exists():
+                    next_still_video.unlink()  # Clean up failed still video
+            except Exception as cleanup_err:
+                log.warning(f"{self.stream_name}: failed to cleanup still video: {cleanup_err}")
             raise
     
     def is_running(self) -> bool:
@@ -198,20 +277,30 @@ class StreamServer:
         if the process doesn't stop within 1 second.
         """
         if not self.is_running():
+            log.debug(f"{self.stream_name}: process not running, nothing to close")
             return
             
         log.debug(f"{self.stream_name}: stopping stream server")
         try:
-            self.process.terminate()
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                log.debug(f"{self.stream_name}: process already terminated")
+                return
+            except Exception as e:
+                log.warning(f"{self.stream_name}: error terminating process: {e}")
+                return
+                
             try:
                 self.process.wait(timeout=1.0)
-                log.debug(f"{self.stream_name}: stream stopped gracefully")
             except subprocess.TimeoutExpired:
-                log.debug(f"{self.stream_name}: forcing stream to stop")
-                self.process.kill()
-                self.process.wait()
+                try:
+                    self.process.kill()
+                    self.process.wait()
+                except Exception as e:
+                    log.warning(f"{self.stream_name}: error killing process: {e}")
         except Exception as e:
-            log.debug(f"{self.stream_name}: error during shutdown: {e}")
+            log.warning(f"{self.stream_name}: unexpected error during shutdown: {e}")
 
     def start_server(self, file_name_initial_video: Union[str, Path]) -> None:
         """Initialize and start the RTSP stream server.
@@ -219,14 +308,39 @@ class StreamServer:
         Args:
             file_name_initial_video: Path to the first video to stream
             
+        Raises:
+            FileNotFoundError: If initial video or FFmpeg not found
+            Exception: If server initialization fails
+            
         Note:
             Creates concat files, generates initial still video, and starts
             the FFmpeg RTSP streaming process.
         """
-        log.debug(f"{self.stream_name}: starting server with {file_name_initial_video}")
-        self._make_concat_files()
-        self.add_video(file_name_initial_video, still_only=True)
-        url = self._run_server()
-        log.info(f"{self.stream_name}: stream ready at {url}")
+        try:
+            file_name_initial_video = Path(file_name_initial_video)
+            if not file_name_initial_video.exists():
+                raise FileNotFoundError(f"Initial video not found: {file_name_initial_video}")
+        except OSError as e:
+            log.error(f"{self.stream_name}: error accessing initial video: {e}")
+            raise
+        
+        try:
+            self._make_concat_files()
+        except Exception as e:
+            log.error(f"{self.stream_name}: failed to create concat files: {e}")
+            raise
+            
+        try:
+            self.add_video(file_name_initial_video, still_only=True)
+        except Exception as e:
+            log.error(f"{self.stream_name}: failed to add initial video: {e}")
+            raise
+            
+        try:
+            url = self._run_server()
+            log.info(f"{self.stream_name}: stream ready at {url}")
+        except Exception as e:
+            log.error(f"{self.stream_name}: failed to start server: {e}")
+            raise
 
     
