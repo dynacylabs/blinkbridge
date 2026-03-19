@@ -23,6 +23,10 @@
       "address": "mediamtx",
       "port": 8554
     },
+    "ffmpeg": {
+      "encoder": "auto",
+      "vaapi_device": "/dev/dri/renderD128"
+    },
     "log_level": "INFO"
 }
   

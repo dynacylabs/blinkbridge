@@ -15,6 +15,7 @@ from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
+from blinkbridge.hwaccel import init_encoder
 from blinkbridge.stream_server import StreamServer
 
 
@@ -165,6 +166,9 @@ class Application:
         """
         try:
             self.running = True
+            log.info("Detecting FFmpeg hardware acceleration...")
+            encoder = init_encoder(CONFIG.get('ffmpeg', {}).get('encoder', 'auto'))
+            log.info(f"Encoder: {encoder.name} ({'hardware' if encoder.is_hardware else 'software'})")
             self.cam_manager = CameraManager()
             await self.cam_manager.start()
         except Exception as e:

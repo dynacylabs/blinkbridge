@@ -4,10 +4,16 @@ FROM python:alpine
 # Install system dependencies
 RUN apk add --no-cache ffmpeg
 
-# Add Intel hardware acceleration support for ffmpeg (optional)
-# RUN apk add --no-cache \
-#     libva-intel-driver \
-#     intel-media-driver
+# Uncomment ONE of the following blocks for hardware-accelerated encoding:
+
+# Intel VAAPI (broadest Intel/AMD GPU support)
+# RUN apk add --no-cache libva-intel-driver intel-media-driver mesa-va-gallium
+
+# Intel QSV (Intel Quick Sync, higher quality, Intel GPUs only)
+# RUN apk add --no-cache intel-media-driver
+
+# NVIDIA NVENC — requires nvidia-container-toolkit on host;
+# consider using nvidia/cuda base image instead of python:alpine
 
 # Set the working directory
 WORKDIR /app/

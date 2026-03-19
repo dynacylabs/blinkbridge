@@ -67,6 +67,25 @@ Edit `config.json` with the following settings:
 - `rtsp_server.address` - MediaMTX server address (default: `mediamtx`)
 - `rtsp_server.port` - RTSP port (default: `8554`)
 
+**FFmpeg Hardware Acceleration** (experimental -- untested, community testing welcome):
+- `ffmpeg.encoder` - Encoder selection (default: `auto`). Options:
+  - `auto` - Automatically detect and use the best available hardware encoder
+  - `h264_nvenc` - NVIDIA GPU (requires nvidia-container-toolkit)
+  - `h264_qsv` - Intel Quick Sync Video
+  - `h264_vaapi` - VA-API (Intel/AMD on Linux)
+  - `h264_videotoolbox` - Apple VideoToolbox (macOS, not available inside Docker)
+  - `h264_v4l2m2m` - V4L2 Memory-to-Memory (Raspberry Pi, ARM SoCs)
+  - `libx264` - Software encoding (always works, default fallback)
+- `ffmpeg.vaapi_device` - VA-API render device path (default: `/dev/dri/renderD128`)
+
+> **Note:** On Mac Docker, no GPU acceleration is available (Docker runs a Linux VM without GPU passthrough). The `auto` setting will detect this and fall back to software encoding automatically.
+
+To enable hardware acceleration in Docker, uncomment the appropriate lines in `compose.yaml`:
+- **Intel/AMD (VAAPI or QSV):** Uncomment `devices: ["/dev/dri:/dev/dri"]` and install the matching driver package in the Dockerfile
+- **NVIDIA:** Uncomment the `runtime: nvidia` section (requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on the host)
+
+> **Warning: Hardware acceleration is experimental and untested.** The `auto` detection runs a real test encode at startup to verify the encoder actually works on your hardware. If the test fails, it falls back to software encoding (`libx264`) automatically. If you encounter issues with a specific GPU or driver, set `"encoder": "libx264"` as a workaround and [open an issue](https://github.com/dynacylabs/blinkbridge/issues) with your hardware details.
+
 ### RTSP Stream URLs
 
 Streams are available at: `rtsp://<host>:8554/<camera_name>`
@@ -81,7 +100,6 @@ rtsp://192.168.1.100:8554/Front_Door   # Network access
 
 ## TODO
 
-- [ ] Support FFmpeg hardware acceleration (e.g. QSV)
 - [ ] Process cameras in parallel and reduce latency
 - [ ] Add ONVIF server with motion events
 

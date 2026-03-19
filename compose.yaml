@@ -10,7 +10,14 @@ services:
       # - type: tmpfs
       #   target: /working
       #   tmpfs:
-      #     size: 52428800  # 50MB  
+      #     size: 52428800  # 50MB
+    # Uncomment for GPU hardware acceleration:
+    # devices:
+    #   - /dev/dri:/dev/dri          # Intel/AMD VAAPI or QSV
+    # For NVIDIA, use the nvidia runtime instead:
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
     tty: true # for color logs
     environment:
       - BLINKBRIDGE_CONFIG=/config/config.json

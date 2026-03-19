@@ -17,6 +17,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
+from blinkbridge.hwaccel import get_encoder
 
 
 log = logging.getLogger(__name__)
@@ -169,15 +170,22 @@ class CameraManager:
             return None
         
         duration = CONFIG['still_video_duration']
+        encoder = get_encoder()
+        encode_args = encoder.build_simple_encode_args()
+        vf = encoder.build_simple_video_filter()
+
         ffmpeg_cmd = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
+            *encoder.init_args,
             '-f', 'lavfi', '-i', f'color=black:s={width}x{height}:d={duration}',
             '-f', 'lavfi', '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
-            '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+            *encode_args,
             '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k',
-            '-t', str(duration), '-pix_fmt', 'yuv420p', '-movflags', 'faststart',
-            str(black_video_path)
+            '-t', str(duration), '-movflags', 'faststart',
         ]
+        if vf:
+            ffmpeg_cmd.extend(['-vf', vf])
+        ffmpeg_cmd.append(str(black_video_path))
         
         log.debug(f"Generating black placeholder video ({width}x{height}, {duration}s)")
         try:

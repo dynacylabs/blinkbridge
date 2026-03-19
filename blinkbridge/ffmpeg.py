@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 from blinkbridge.config import *
+from blinkbridge.hwaccel import get_encoder
 
 
 log = logging.getLogger(__name__)
@@ -285,17 +286,20 @@ class FrameToVideo:
             log.error(f"Failed to create output directory: {e}")
             raise
         
+        encoder = get_encoder()
+        vf_string = encoder.build_video_filter(
+            params_video['width'], params_video['height'], fps_value
+        )
+        encode_args = encoder.build_encode_args(params_video)
+
         ffmpeg_params = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
+            *encoder.init_args,
             '-loop', '1', '-i', str(image_file_name),
             '-f', 'lavfi', '-i', f"anullsrc=channel_layout={audio_channels}:sample_rate={audio_sample_rate}",
-            '-c:v', params_video['codec_name'],
-            '-pix_fmt', params_video['pix_fmt'],
+            *encode_args,
             '-t', str(output_duration),
-            '-vf', f"scale={params_video['width']}:{params_video['height']},fps={fps_value}",
-            '-b:v', params_video['bit_rate'],
-            '-profile:v', params_video['profile'],
-            '-level:v', params_video['level'],
+            '-vf', vf_string,
             '-movflags', 'faststart',
             '-video_track_timescale', time_base_denominator,
             '-fps_mode', 'passthrough',
