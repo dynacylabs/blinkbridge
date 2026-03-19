@@ -82,7 +82,6 @@ rtsp://192.168.1.100:8554/Front_Door   # Network access
 ## TODO
 
 - [ ] Better error handling
-- [ ] Cleanup code
 - [ ] Support FFmpeg hardware acceleration (e.g. QSV)
 - [ ] Process cameras in parallel and reduce latency
 - [ ] Add ONVIF server with motion events

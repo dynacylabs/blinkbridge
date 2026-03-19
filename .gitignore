@@ -1,1 +1,42 @@
+# Blink credentials
 config/.cred.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Working directory outputs
+*.mp4
+*.concat
+*.jpg
+*.jpeg
+*.png
+
+# Logs
+*.log
+
+# Temporary files
+.tmp/
+tmp/
+
+# Pycache
+__pycache__
