@@ -62,6 +62,7 @@ Edit `config.json` with the following settings:
 - `blink.login.password` - Your Blink account password
 - `blink.history_days` - Days to look back in history (default: `90`)
 - `blink.poll_interval` - Polling interval in minutes (default: `1`, minimum recommended)
+- `blink.metadata_pages` - Number of API pages to fetch for video metadata, ~25 clips per page (default: `10`)
 
 **RTSP Server:**
 - `rtsp_server.address` - MediaMTX server address (default: `mediamtx`)

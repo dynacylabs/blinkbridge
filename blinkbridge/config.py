@@ -137,6 +137,7 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['cameras'].setdefault('max_failures', 3)
         CONFIG['blink'].setdefault('history_days', 90)
         CONFIG['blink'].setdefault('poll_interval', 1)
+        CONFIG['blink'].setdefault('metadata_pages', 10)
         CONFIG.setdefault('ffmpeg', {})
         CONFIG['ffmpeg'].setdefault('encoder', 'auto')
         CONFIG['ffmpeg'].setdefault('vaapi_device', '/dev/dri/renderD128')
