@@ -13,7 +13,7 @@ recorded after the bridge started.
 import asyncio
 import logging
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
@@ -153,7 +153,7 @@ class Application:
         """Start the application, initialize cameras, and begin monitoring."""
         try:
             self.running = True
-            self.bridge_start_time = datetime.utcnow()
+            self.bridge_start_time = datetime.now(timezone.utc)
             log.info("Detecting FFmpeg hardware acceleration...")
             encoder = init_encoder(CONFIG.get('ffmpeg', {}).get('encoder', 'auto'))
             log.info(f"Encoder: {encoder.name} ({'hardware' if encoder.is_hardware else 'software'})")
@@ -506,7 +506,7 @@ class Application:
                 # Transition: was offline → now online
                 elif is_online and current_state == CameraState.OFFLINE:
                     log.info(f"{camera_name}: came back ONLINE, transitioning to WAITING")
-                    self.freshness_threshold[camera_name] = datetime.utcnow()
+                    self.freshness_threshold[camera_name] = datetime.now(timezone.utc)
                     waiting_video = self.cam_manager.get_waiting_video()
                     if waiting_video:
                         try:
@@ -538,7 +538,7 @@ class Application:
                     break
                 
                 self.disabled_cameras.discard(camera_name)
-                self.freshness_threshold[camera_name] = datetime.utcnow()
+                self.freshness_threshold[camera_name] = datetime.now(timezone.utc)
                 
                 ss = self._start_stream_server(camera_name, init_video)
                 if ss is None:
