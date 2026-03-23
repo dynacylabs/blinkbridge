@@ -565,7 +565,7 @@ class CameraManager:
                 for network in response['networks']:
                     network_id = network.get('network_id', '?')
                     cam_names = [c.get('name', '?') for c in network.get('cameras', [])]
-                    log.info(f'camera_usage: network {network_id}: {cam_names}')
+                    log.debug(f'camera_usage: network {network_id}: {cam_names}')
         except Exception as e:
             log.error(f'Failed to query camera_usage API: {e}')
 
