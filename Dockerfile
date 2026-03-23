@@ -1,8 +1,8 @@
 # Use the Python Alpine image
 FROM python:alpine
 
-# Install system dependencies
-RUN apk add --no-cache ffmpeg
+# Install system dependencies (ttf-freefont provides fonts for FFmpeg drawtext overlay)
+RUN apk add --no-cache ffmpeg ttf-freefont
 
 # Uncomment ONE of the following blocks for hardware-accelerated encoding:
 

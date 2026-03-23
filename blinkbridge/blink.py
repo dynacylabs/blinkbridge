@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -195,6 +195,7 @@ class CameraManager:
         escaped_text = text.replace("'", "\\'").replace(":", "\\:")
         drawtext = (
             f"drawtext=text='{escaped_text}'"
+            f":fontfile=/usr/share/fonts/freefont/FreeSans.ttf"
             f":fontsize=48:fontcolor=white"
             f":x=(w-text_w)/2:y=(h-text_h)/2"
         )
@@ -262,8 +263,9 @@ class CameraManager:
             timestamp: Formatted timestamp string (MM/DD/YYYY HH:MM)
         """
         text = f"Offline as of {timestamp}"
-        # Each unique timestamp gets its own cached file via a timestamp-derived key
-        cache_key = f"offline-{timestamp}"
+        # Sanitize timestamp for use as filename (slashes/colons are invalid in paths)
+        safe_ts = timestamp.replace('/', '-').replace(':', '-').replace(' ', '_')
+        cache_key = f"offline-{safe_ts}"
         return self._generate_overlay_video(text, cache_key=cache_key)
     
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
@@ -337,8 +339,10 @@ class CameraManager:
                     try:
                         clip_time = datetime.fromisoformat(
                             m['created_at'].replace('Z', '+00:00')
-                        ).replace(tzinfo=None)
-                        if clip_time <= since:
+                        )
+                        # Ensure both sides are tz-aware for comparison
+                        since_aware = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+                        if clip_time <= since_aware:
                             continue
                     except (KeyError, ValueError, TypeError):
                         continue
