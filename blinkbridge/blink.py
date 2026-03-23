@@ -262,8 +262,9 @@ class CameraManager:
             timestamp: Formatted timestamp string (MM/DD/YYYY HH:MM)
         """
         text = f"Offline as of {timestamp}"
-        # Each unique timestamp gets its own file (not cached by key since timestamp changes)
-        return self._generate_overlay_video(text)
+        # Each unique timestamp gets its own cached file via a timestamp-derived key
+        cache_key = f"offline-{timestamp}"
+        return self._generate_overlay_video(text, cache_key=cache_key)
     
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
         """Detect resolution from clips. Returns default Blink resolution (1920x1080).
