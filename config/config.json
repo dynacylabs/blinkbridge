@@ -29,6 +29,6 @@
       "encoder": "auto",
       "vaapi_device": "/dev/dri/renderD128"
     },
-    "log_level": "DEBUG"
+    "log_level": "INFO"
 }
   
