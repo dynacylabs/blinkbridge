@@ -232,7 +232,8 @@ class CameraManager:
         """Refresh video metadata from Blink API.
         
         Fetches recent video clips based on CONFIG['blink']['history_days'].
-        Updates self.metadata with the latest available clips.
+        Uses CONFIG['blink']['metadata_pages'] to control pagination depth
+        (~25 items per page). Updates self.metadata with the latest available clips.
         
         Raises:
             Exception: If API call fails
@@ -240,8 +241,16 @@ class CameraManager:
         try:
             log.debug('refreshing video metadata')
             dt_past = datetime.now() - timedelta(days=CONFIG['blink']['history_days'])
-            self.metadata = await self.blink.get_videos_metadata(since=str(dt_past), stop=2)
-            log.debug(f'Retrieved {len(self.metadata) if self.metadata else 0} video metadata entries')
+            stop = CONFIG['blink']['metadata_pages'] + 1  # BlinkPy uses range(1, stop)
+            self.metadata = await self.blink.get_videos_metadata(since=str(dt_past), stop=stop)
+            count = len(self.metadata) if self.metadata else 0
+            log.debug(f'Retrieved {count} video metadata entries')
+            if self.metadata:
+                cameras_with_clips = defaultdict(int)
+                for m in self.metadata:
+                    if not m.get('deleted') and m.get('source') != 'snapshot':
+                        cameras_with_clips[m.get('device_name', 'unknown')] += 1
+                log.debug(f'Clips per camera: {dict(cameras_with_clips)}')
         except Exception as e:
             log.error(f"Failed to refresh video metadata: {e}")
             # Keep existing metadata if refresh fails

@@ -17,7 +17,8 @@
         "password": ""
       },
       "history_days": 90,
-      "poll_interval": 1
+      "poll_interval": 1,
+      "metadata_pages": 10
     },
     "rtsp_server": {
       "address": "mediamtx",
