@@ -34,17 +34,20 @@ class Application:
     
     Coordinates CameraManager and StreamServer instances for each camera,
     handles motion detection polling, stream failures, and restarts.
+    Periodically scans for new cameras that come online.
     
     Attributes:
         stream_servers: Dict mapping camera names to StreamServer instances
         cam_manager: CameraManager instance for Blink integration
         running: Boolean flag indicating if application should continue running
+        disabled_cameras: Set of cameras that hit max failures and were disabled
     """
     
     def __init__(self) -> None:
         self.stream_servers: Dict[str, StreamServer] = {}
         self.cam_manager: Optional[CameraManager] = None
         self.running: bool = False
+        self.disabled_cameras: set = set()
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> Optional[StreamServer]:
         """Start a stream server for a camera.
@@ -249,7 +252,11 @@ class Application:
         Note:
             Warns if poll_interval is less than BlinkPy's API throttle limit.
         """
-        log.info(f"monitoring cameras for motion (poll interval: {CONFIG['blink']['poll_interval']}s)")
+        log.info(
+            f"monitoring cameras for motion "
+            f"(poll interval: {CONFIG['blink']['poll_interval']}s, "
+            f"camera scan interval: {CONFIG['cameras']['scan_interval']}m)"
+        )
         
         if CONFIG['blink']['poll_interval'] < MIN_BLINK_THROTTLE:
             log.warning(
@@ -258,8 +265,11 @@ class Application:
                 f"Effective poll rate will be ~{MIN_BLINK_THROTTLE}s due to API throttling."
             )
         
+        scan_interval = timedelta(minutes=CONFIG['cameras']['scan_interval'])
+        
         poll_count = 0
         last_log_time = datetime.now()
+        last_scan_time = datetime.now()
         log_interval = timedelta(seconds=LOG_INTERVAL_SECONDS)
         
         while self.running:
@@ -269,6 +279,10 @@ class Application:
             if datetime.now() - last_log_time >= log_interval:
                 self._log_camera_status(poll_count)
                 last_log_time = datetime.now()
+            
+            if datetime.now() - last_scan_time >= scan_interval:
+                await self._discover_new_cameras()
+                last_scan_time = datetime.now()
             
             await self._check_cameras_for_updates()
             await self._restart_failed_streams()
@@ -282,9 +296,11 @@ class Application:
         """
         active_cams = len(self.stream_servers) - len(self.cam_manager.cameras_without_clips)
         waiting_cams = len(self.cam_manager.cameras_without_clips)
+        disabled_cams = len(self.disabled_cameras)
         log.debug(
             f"Poll #{poll_count}: {active_cams} cameras active, "
-            f"{waiting_cams} waiting for first clip"
+            f"{waiting_cams} waiting for first clip, "
+            f"{disabled_cams} disabled"
         )
     
     async def _check_cameras_for_updates(self) -> None:
@@ -330,6 +346,7 @@ class Application:
                 
                 if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
                     log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
+                    self.disabled_cameras.add(camera_name)
                     try:
                         self.stream_servers.pop(camera_name)
                     except KeyError:
@@ -353,6 +370,50 @@ class Application:
                 log.info(f"{camera_name}: stream restarted successfully")
             except Exception as e:
                 log.error(f"{camera_name}: error during stream restart: {e}", exc_info=True)
+
+    async def _discover_new_cameras(self) -> None:
+        """Scan for new cameras and start streams for any not currently managed.
+        
+        Calls BlinkPy's setup_post_verify() to re-enumerate all cameras,
+        then starts streams for any new cameras that pass the enabled/disabled
+        filter and aren't already running. Also retries previously disabled
+        cameras (those that hit max_failures), giving them a fresh start.
+        """
+        try:
+            log.debug("Scanning for new cameras...")
+            all_cameras = await self.cam_manager.refresh_cameras()
+            await self.cam_manager.refresh_metadata()
+            
+            enabled_cameras = self._get_enabled_cameras()
+            
+            cameras_to_start = enabled_cameras - set(self.stream_servers.keys())
+            if not cameras_to_start:
+                return
+            
+            # Log retried vs truly new cameras separately
+            retried = cameras_to_start & self.disabled_cameras
+            new = cameras_to_start - self.disabled_cameras
+            if new:
+                log.info(f"Found {len(new)} new camera(s) to start: {new}")
+            if retried:
+                log.info(f"Retrying {len(retried)} previously disabled camera(s): {retried}")
+            
+            for camera_name in cameras_to_start:
+                if not self.running:
+                    break
+                
+                self.disabled_cameras.discard(camera_name)
+                
+                ss = await self.start_stream(camera_name)
+                if ss is None:
+                    log.warning(f"{camera_name}: failed to start stream for camera")
+                    continue
+                
+                ss.failure_count = 0
+                ss.datetime_started = datetime.now()
+                await asyncio.sleep(0)
+        except Exception as e:
+            log.error(f"Error during camera discovery: {e}", exc_info=True)
 
     async def close(self) -> None:
         """Close the application and stop all streams.

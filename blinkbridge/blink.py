@@ -507,6 +507,29 @@ class CameraManager:
             Iterator of camera name strings
         """
         return self.blink.cameras.keys()
+
+    async def refresh_cameras(self) -> set:
+        """Re-run camera discovery to find newly added cameras.
+        
+        Calls BlinkPy's setup_post_verify() to re-enumerate all cameras
+        from the Blink API. This picks up cameras that were added or came
+        online after initial startup.
+        
+        Returns:
+            Set of all currently known camera names after refresh
+        """
+        try:
+            log.debug('Re-scanning Blink account for cameras')
+            previous_cameras = set(self.blink.cameras.keys())
+            await self.blink.setup_post_verify()
+            current_cameras = set(self.blink.cameras.keys())
+            new_cameras = current_cameras - previous_cameras
+            if new_cameras:
+                log.info(f'Discovered {len(new_cameras)} new camera(s): {new_cameras}')
+            return current_cameras
+        except Exception as e:
+            log.error(f"Failed to refresh camera list: {e}")
+            return set(self.blink.cameras.keys())
     
     async def start(self) -> None:
         """Initialize the camera manager.

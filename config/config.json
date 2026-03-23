@@ -9,7 +9,8 @@
       "enabled": [],
       "disabled": [],
       "max_failures": 3,
-      "restart_delay_seconds": 60
+      "restart_delay_seconds": 60,
+      "scan_interval": 5
     },
     "blink": {
       "login": {
