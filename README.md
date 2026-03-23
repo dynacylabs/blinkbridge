@@ -56,6 +56,8 @@ Edit `config.json` with the following settings:
 - `cameras.disabled` - List of camera names to disable
 - `cameras.max_failures` - Max consecutive failures before stopping a stream (default: `3`)
 - `cameras.restart_delay_seconds` - Delay before restarting after failure (default: `60`)
+- `cameras.scan_interval` - How often to scan for new cameras in minutes (default: `5`). Picks up cameras added or brought online after startup
+- `cameras.removal_scans` - Number of consecutive scan intervals a missing camera must be absent before its stream is removed (default set in code). Controls how quickly offline or deleted cameras are cleaned up.
 
 **Blink Account:**
 - `blink.login.username` - Your Blink account email

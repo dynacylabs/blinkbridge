@@ -15,6 +15,7 @@ from aiohttp import ClientSession
 from blinkpy.auth import Auth, BlinkTwoFARequiredError, TokenRefreshFailed, LoginError
 from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
+from blinkpy import api as blink_api
 
 from blinkbridge.config import *
 from blinkbridge.hwaccel import get_encoder
@@ -53,27 +54,29 @@ def find_most_recent_clip_url(recent_clips: dict, date: str) -> str:
 class CameraManager:
     """Manages Blink camera connections and video clip downloads.
     
-    Handles authentication, metadata management, clip downloads, and motion detection
-    for Blink camera systems. Maintains state about which cameras have clips available
-    and provides black video placeholders for cameras without recorded content.
+    Handles authentication, clip downloads, and motion detection for Blink
+    camera systems. Discovers ALL cameras (including those on offline sync
+    modules) and provides per-camera online/offline status detection.
     
     Attributes:
         session: aiohttp ClientSession for HTTP requests
         blink: BlinkPy Blink instance
         camera_last_record: Dict tracking last recorded event per camera
         metadata: List of video metadata from Blink API
-        black_video_path: Path to black placeholder video
-        cameras_without_clips: Set of cameras currently without clips
-        cameras_ever_had_real_clip: Set of cameras that have had clips (persistent)
+        all_camera_names: Set of all camera names across all sync modules
+        camera_sync_map: Dict mapping camera name to sync module name
     """
     
     def __init__(self) -> None:
         self.session: ClientSession = ClientSession()
         self.camera_last_record: Dict[str, Optional[str]] = defaultdict(lambda: None)
         self.metadata: Optional[list] = None
-        self.black_video_path: Optional[Path] = None
-        self.cameras_without_clips: set = set()
-        self.cameras_ever_had_real_clip: set = set()
+        # All cameras discovered from API (including offline sync modules)
+        self.all_camera_names: set = set()
+        # Maps camera name -> sync module name
+        self.camera_sync_map: Dict[str, str] = {}
+        # Overlay videos (text on black background)
+        self._overlay_cache: Dict[str, Path] = {}
 
     async def _login(self) -> None:
         """Login to Blink using OAuth v2 authentication.
@@ -143,36 +146,63 @@ class CameraManager:
         except (IOError, OSError) as e:
             log.warning(f"Failed to save credentials (will need to re-authenticate next time): {e}")
 
-    def _generate_black_video(self, width: int = 1920, height: int = 1080) -> Optional[Path]:
-        """Generate a black video file to use as placeholder for cameras without clips.
+        # Diagnostic: dump raw camera_usage and homescreen APIs
+        await self._log_raw_api_data()
+
+    def _generate_overlay_video(self, text: str, cache_key: str = None,
+                                width: int = 1920, height: int = 1080) -> Optional[Path]:
+        """Generate a black video with centered white text overlay.
         
         Args:
+            text: Text to display on the black background
+            cache_key: Optional key for caching. If provided and a cached video
+                       exists with this key, returns the cached path. If None,
+                       always generates a new file.
             width: Video width in pixels (default: 1920)
             height: Video height in pixels (default: 1080)
             
         Returns:
-            Path to the generated black video file, or None if generation failed
-            
-        Note:
-            Uses FFmpeg to create a video with black frames and silent audio.
-            The duration matches CONFIG['still_video_duration'].
+            Path to the generated overlay video, or None if generation failed
         """
         import subprocess
         
-        black_video_path = PATH_VIDEOS / "_black_placeholder.mp4"
+        if cache_key and cache_key in self._overlay_cache:
+            cached = self._overlay_cache[cache_key]
+            try:
+                if cached.exists():
+                    return cached
+            except OSError:
+                pass
         
-        try:
-            if black_video_path.exists():
-                log.debug(f"Black video already exists at {black_video_path}")
-                return black_video_path
-        except OSError as e:
-            log.error(f"Error checking if black video exists: {e}")
-            return None
+        safe_name = cache_key or text.lower().replace(' ', '_').replace('/', '-').replace(':', '-')
+        output_path = PATH_VIDEOS / f"_overlay_{safe_name}.mp4"
+        
+        # If not cached but file exists on disk, use it (for static overlays)
+        if cache_key:
+            try:
+                if output_path.exists():
+                    self._overlay_cache[cache_key] = output_path
+                    return output_path
+            except OSError:
+                pass
         
         duration = CONFIG['still_video_duration']
         encoder = get_encoder()
         encode_args = encoder.build_simple_encode_args()
-        vf = encoder.build_simple_video_filter()
+        vf_base = encoder.build_simple_video_filter()
+
+        # Escape text for FFmpeg drawtext filter
+        escaped_text = text.replace("'", "\\'").replace(":", "\\:")
+        drawtext = (
+            f"drawtext=text='{escaped_text}'"
+            f":fontsize=48:fontcolor=white"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+        
+        if vf_base:
+            vf = f"{vf_base},{drawtext}"
+        else:
+            vf = drawtext
 
         ffmpeg_cmd = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
@@ -182,16 +212,15 @@ class CameraManager:
             *encode_args,
             '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k',
             '-t', str(duration), '-movflags', 'faststart',
+            '-vf', vf,
+            str(output_path)
         ]
-        if vf:
-            ffmpeg_cmd.extend(['-vf', vf])
-        ffmpeg_cmd.append(str(black_video_path))
         
-        log.debug(f"Generating black placeholder video ({width}x{height}, {duration}s)")
+        log.debug(f"Generating overlay video: '{text}' ({width}x{height})")
         try:
             result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
         except subprocess.TimeoutExpired:
-            log.error("FFmpeg timed out while generating black video")
+            log.error("FFmpeg timed out while generating overlay video")
             return None
         except FileNotFoundError:
             log.error("FFmpeg not found. Please ensure FFmpeg is installed and in PATH")
@@ -202,19 +231,40 @@ class CameraManager:
         
         if result.returncode != 0:
             stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'No error output'
-            log.error(f"Failed to generate black video (exit code {result.returncode}): {stderr}")
+            log.error(f"Failed to generate overlay video (exit code {result.returncode}): {stderr}")
             return None
         
         try:
-            if not black_video_path.exists():
-                log.error(f"Black video was not created at {black_video_path}")
+            if not output_path.exists():
+                log.error(f"Overlay video was not created at {output_path}")
                 return None
         except OSError as e:
-            log.error(f"Error verifying black video creation: {e}")
+            log.error(f"Error verifying overlay video creation: {e}")
             return None
         
-        log.debug(f"Black placeholder video created at {black_video_path}")
-        return black_video_path
+        if cache_key:
+            self._overlay_cache[cache_key] = output_path
+        log.debug(f"Overlay video created at {output_path}")
+        return output_path
+    
+    def get_initializing_video(self) -> Optional[Path]:
+        """Get the 'Initializing' overlay video, generating if needed."""
+        return self._generate_overlay_video("Initializing", cache_key="initializing")
+    
+    def get_waiting_video(self) -> Optional[Path]:
+        """Get the 'Waiting' overlay video, generating if needed."""
+        return self._generate_overlay_video("Waiting", cache_key="waiting")
+    
+    def get_offline_video(self, timestamp: str) -> Optional[Path]:
+        """Get an 'Offline as of ...' overlay video.
+        
+        Args:
+            timestamp: Formatted timestamp string (MM/DD/YYYY HH:MM)
+        """
+        text = f"Offline as of {timestamp}"
+        # Each unique timestamp gets its own cached file via a timestamp-derived key
+        cache_key = f"offline-{timestamp}"
+        return self._generate_overlay_video(text, cache_key=cache_key)
     
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
         """Detect resolution from clips. Returns default Blink resolution (1920x1080).
@@ -258,21 +308,16 @@ class CameraManager:
                 self.metadata = []
             raise
 
-    async def save_latest_clip(self, camera_name: str, force: bool=False, use_black_fallback: bool=True) -> Optional[Path]:
+    async def save_latest_clip(self, camera_name: str, since: datetime = None) -> Optional[Path]:
         """Download and save latest clip for camera.
         
         Args:
             camera_name: Name of the camera
-            force: Force re-download even if clip exists (default: False)
-            use_black_fallback: Use black video if no clips available, only for 
-                cameras that never had clips (default: True)
+            since: Only return clips newer than this datetime. If None, returns
+                the most recent clip regardless of age.
         
         Returns:
-            Path to the video file, or None if unavailable and no fallback
-            
-        Note:
-            Once a camera has had a real clip, it will never fall back to the
-            black placeholder video, even if new clips temporarily unavailable.
+            Path to the video file, or None if no qualifying clip found
         """
         try:
             camera_name_sanitized = camera_name.lower().replace(' ', '_')
@@ -280,32 +325,31 @@ class CameraManager:
         except Exception as e:
             log.error(f"{camera_name}: error creating file path: {e}")
             return None
-    
-        try:
-            if file_name.exists() and not force:
-                log.debug(f"{camera_name}: skipping download, {file_name} exists")
-                if file_name != self.black_video_path:
-                    self.cameras_without_clips.discard(camera_name)
-                    self.cameras_ever_had_real_clip.add(camera_name)
-                return file_name
-        except OSError as e:
-            log.warning(f"{camera_name}: error checking if file exists: {e}")
 
         try:
-            media = next((m for m in self.metadata if m['device_name'] == camera_name 
-                        if not m['deleted'] and m['source'] != 'snapshot'), None)
+            media = None
+            for m in (self.metadata or []):
+                if m.get('device_name') != camera_name:
+                    continue
+                if m.get('deleted') or m.get('source') == 'snapshot':
+                    continue
+                if since:
+                    try:
+                        clip_time = datetime.fromisoformat(
+                            m['created_at'].replace('Z', '+00:00')
+                        ).replace(tzinfo=None)
+                        if clip_time <= since:
+                            continue
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                media = m
+                break  # metadata is sorted newest-first
         except Exception as e:
             log.error(f"{camera_name}: error searching metadata: {e}")
             media = None
 
         if media is None:
-            log.warning(f"{camera_name}: no clips found for camera")
-            if use_black_fallback and self.black_video_path and camera_name not in self.cameras_ever_had_real_clip:
-                log.info(f"{camera_name}: using black video placeholder (never had real clip)")
-                self.cameras_without_clips.add(camera_name)
-                return self.black_video_path
-            elif camera_name in self.cameras_ever_had_real_clip:
-                log.warning(f"{camera_name}: no new clips found, but camera has had real clips before")
+            log.debug(f"{camera_name}: no qualifying clips found")
             return None
 
         try:
@@ -326,42 +370,18 @@ class CameraManager:
             with open(file_name, 'wb') as f:
                 f.write(video_data)
             
-            # Verify file was written
             if not file_name.exists() or file_name.stat().st_size == 0:
                 log.error(f"{camera_name}: video file not created or is empty")
                 raise IOError("Failed to write video file")
             
-            self.cameras_without_clips.discard(camera_name)
-            self.cameras_ever_had_real_clip.add(camera_name)
-            log.debug(f"{camera_name}: successfully downloaded real clip ({file_name.stat().st_size} bytes)")
+            log.debug(f"{camera_name}: downloaded clip ({file_name.stat().st_size} bytes)")
             return file_name
         except IOError as e:
             log.error(f"{camera_name}: file I/O error downloading clip: {e}")
         except Exception as e:
             log.error(f"{camera_name}: failed to download clip: {e}")
-        
-        # If download fails but camera had clips before, try to use cached file
-        try:
-            if camera_name in self.cameras_ever_had_real_clip and file_name.exists():
-                log.warning(f"{camera_name}: using cached clip after download failure")
-                return file_name
-        except OSError:
-            pass
             
         return None
-    
-    def _mark_camera_has_clip(self, camera_name: str) -> None:
-        """Mark that a camera has a real clip.
-        
-        Args:
-            camera_name: Name of the camera
-            
-        Note:
-            This is a permanent state change - once marked, the camera will
-            never fall back to black placeholder video.
-        """
-        self.cameras_without_clips.discard(camera_name)
-        self.cameras_ever_had_real_clip.add(camera_name)
     
     async def _save_clip(self, camera_name: str, url: str, file_name: Path) -> None:
         """Save a video clip from URL to file.
@@ -463,7 +483,6 @@ class CameraManager:
                     log.debug(f"{camera_name}: found recent clip in snapshot, saving to {file_name}")
                     try:
                         await self._save_clip(camera_name, url, file_name)
-                        self._mark_camera_has_clip(camera_name)
                         self.camera_last_record[camera_name] = last_record
                         log.debug(f"{camera_name}: clip saved to {file_name}")
                         return file_name
@@ -489,7 +508,6 @@ class CameraManager:
                 log.error(f"{camera_name}: video file not created or is empty")
                 return None
                 
-            self._mark_camera_has_clip(camera_name)
             self.camera_last_record[camera_name] = last_record
             log.debug(f"{camera_name}: clip saved to {file_name} ({file_name.stat().st_size} bytes)")
             return file_name
@@ -500,19 +518,173 @@ class CameraManager:
             log.error(f"{camera_name}: error downloading clip: {e}")
             return None
         
+    def _log_blink_diagnostics(self) -> None:
+        """Log diagnostic info about Blink's internal camera/sync module state."""
+        try:
+            # Homescreen info
+            hs = getattr(self.blink, 'homescreen', None)
+            if hs:
+                owls = hs.get('owls', [])
+                doorbells = hs.get('doorbells', [])
+                owl_names = [o.get('name', 'unknown') for o in owls] if owls else []
+                doorbell_names = [d.get('name', 'unknown') for d in doorbells] if doorbells else []
+                log.debug(f'Homescreen owls (Minis): {owl_names}')
+                log.debug(f'Homescreen doorbells: {doorbell_names}')
+            else:
+                log.debug('Homescreen data: None/empty')
+            
+            # Sync modules — show online status, populated cameras AND raw camera_list
+            sync = getattr(self.blink, 'sync', {})
+            for sync_name, sync_mod in sync.items():
+                sync_type = type(sync_mod).__name__
+                sync_online = getattr(sync_mod, 'online', 'unknown')
+                sync_available = getattr(sync_mod, 'available', 'unknown')
+                sync_cams = list(sync_mod.cameras.keys()) if hasattr(sync_mod, 'cameras') else []
+                raw_cam_list = getattr(sync_mod, 'camera_list', [])
+                raw_cam_names = [c.get('name', 'unknown') for c in raw_cam_list] if isinstance(raw_cam_list, list) else raw_cam_list
+                log.debug(
+                    f'Sync "{sync_name}" ({sync_type}): online={sync_online}, '
+                    f'available={sync_available}, cameras={sync_cams}, '
+                    f'camera_list(raw)={raw_cam_names}'
+                )
+            
+            # All merged cameras with types
+            for cam_name, cam in self.blink.cameras.items():
+                cam_type = getattr(cam, 'camera_type', 'unknown')
+                product_type = getattr(cam, 'product_type', 'unknown')
+                log.debug(f'Camera "{cam_name}": type={cam_type}, product={product_type}')
+        except Exception as e:
+            log.debug(f'Error logging diagnostics: {e}')
+
+    async def _log_raw_api_data(self) -> None:
+        """Log raw API responses for camera_usage to diagnose missing cameras."""
+        try:
+            response = await blink_api.request_camera_usage(self.blink)
+            log.debug(f'Raw camera_usage API response: {response}')
+            if response and 'networks' in response:
+                for network in response['networks']:
+                    network_id = network.get('network_id', '?')
+                    cam_names = [c.get('name', '?') for c in network.get('cameras', [])]
+                    log.debug(f'camera_usage: network {network_id}: {cam_names}')
+        except Exception as e:
+            log.error(f'Failed to query camera_usage API: {e}')
+
+    def get_all_cameras(self) -> set:
+        """Get ALL camera names from all sync modules, including offline ones.
+        
+        Reads camera_list from each sync module (populated by request_camera_usage
+        and homescreen APIs regardless of sync module online status) and merges
+        with blink.cameras for a complete set.
+        
+        Returns:
+            Set of all camera names across all sync modules
+        """
+        all_names = set(self.blink.cameras.keys())
+        self.camera_sync_map.clear()
+        
+        sync = getattr(self.blink, 'sync', {})
+        for sync_name, sync_mod in sync.items():
+            raw_list = getattr(sync_mod, 'camera_list', [])
+            if isinstance(raw_list, list):
+                for cam in raw_list:
+                    name = cam.get('name') if isinstance(cam, dict) else None
+                    if name:
+                        all_names.add(name)
+                        self.camera_sync_map[name] = sync_name
+            # Also map cameras from blink.cameras to their sync module
+            if hasattr(sync_mod, 'cameras'):
+                for cam_name in sync_mod.cameras:
+                    self.camera_sync_map[cam_name] = sync_name
+        
+        self.all_camera_names = all_names
+        log.debug(f'All cameras (including offline sync modules): {all_names} ({len(all_names)} total)')
+        return all_names
+    
+    def is_camera_online(self, camera_name: str) -> bool:
+        """Check if a camera is online using set difference + homescreen status.
+        
+        Detection logic:
+        1. Standard cameras: present in blink.cameras = online (only populated
+           for cameras whose sync module is online). Absent = offline.
+        2. Minis/Doorbells: always in blink.cameras regardless of status, so
+           check homescreen["owls"/"doorbells"] for the "status" field.
+        
+        Args:
+            camera_name: Name of the camera
+            
+        Returns:
+            True if camera is online, False otherwise
+        """
+        if camera_name not in self.blink.cameras:
+            # Not in blink.cameras = offline (standard camera on offline sync)
+            return False
+        
+        # It's in blink.cameras. For Minis/Doorbells, check homescreen status
+        # since they always get populated even when offline.
+        hs = getattr(self.blink, 'homescreen', None)
+        if hs:
+            for owl in (hs.get('owls') or []):
+                if owl.get('name') == camera_name:
+                    return owl.get('status', '').lower() == 'online'
+            for doorbell in (hs.get('doorbells') or []):
+                if doorbell.get('name') == camera_name:
+                    return doorbell.get('status', '').lower() == 'online'
+        
+        # Standard camera in blink.cameras = online
+        return True
+    
+    def get_online_cameras(self) -> set:
+        """Get set of camera names that are currently online."""
+        return {name for name in self.all_camera_names if self.is_camera_online(name)}
+    
+    def get_offline_cameras(self) -> set:
+        """Get set of camera names that are currently offline."""
+        return {name for name in self.all_camera_names if not self.is_camera_online(name)}
+
     def get_cameras(self) -> iter:
         """Get iterator of all available camera names.
         
         Returns:
             Iterator of camera name strings
         """
-        return self.blink.cameras.keys()
+        return self.all_camera_names
+
+    async def refresh_cameras(self) -> set:
+        """Re-run camera discovery to find newly added cameras.
+        
+        Calls BlinkPy's setup_post_verify() to re-enumerate all cameras
+        from the Blink API. This picks up cameras that were added or came
+        online after initial startup.
+        
+        Returns:
+            Set of all currently known camera names after refresh
+        """
+        try:
+            log.debug('Re-scanning Blink account for cameras')
+            previous_cameras = set(self.blink.cameras.keys())
+            log.debug(f'Cameras before refresh: {previous_cameras}')
+            await self.blink.setup_post_verify()
+            current_cameras = set(self.blink.cameras.keys())
+            log.debug(f'Cameras after refresh: {current_cameras}')
+            new_cameras = current_cameras - previous_cameras
+            removed_cameras = previous_cameras - current_cameras
+            if new_cameras:
+                log.info(f'Discovered {len(new_cameras)} new camera(s): {new_cameras}')
+            if removed_cameras:
+                log.info(f'{len(removed_cameras)} camera(s) no longer reported by API: {removed_cameras}')
+            log.debug(f'Total cameras from Blink API: {len(current_cameras)}')
+            self._log_blink_diagnostics()
+            return current_cameras
+        except Exception as e:
+            log.error(f"Failed to refresh camera list: {e}")
+            return set(self.blink.cameras.keys())
     
     async def start(self) -> None:
         """Initialize the camera manager.
         
-        Performs authentication, refreshes metadata, and generates the black
-        video placeholder for cameras without clips.
+        Performs authentication, refreshes metadata, builds the complete
+        camera list (including offline sync modules), and generates
+        overlay videos.
         
         Raises:
             LoginError: If authentication fails
@@ -523,23 +695,20 @@ class CameraManager:
         except Exception as e:
             log.error(f"Login failed: {e}")
             raise
-            
-        try:
-            await self.refresh_metadata()
-        except Exception as e:
-            log.warning(f"Failed to refresh metadata during startup: {e}")
-            # Continue with empty metadata
-            self.metadata = []
         
-        # Generate black video placeholder
+        self._log_blink_diagnostics()
+        
+        # Build complete camera list from all sync modules
+        self.get_all_cameras()
+        
+        # Pre-generate overlay videos
         try:
-            width, height = self._detect_resolution_from_clips()
-            self.black_video_path = self._generate_black_video(width, height)
-            if not self.black_video_path:
-                log.warning("Failed to create black video placeholder, cameras without clips will be skipped")
+            if not self.get_initializing_video():
+                log.warning("Failed to create 'Initializing' overlay video")
+            if not self.get_waiting_video():
+                log.warning("Failed to create 'Waiting' overlay video")
         except Exception as e:
-            log.error(f"Error generating black video placeholder: {e}")
-            self.black_video_path = None
+            log.error(f"Error generating overlay videos: {e}")
     
     async def close(self) -> None:
         """Properly close all connections and clean up resources.
