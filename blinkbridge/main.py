@@ -1,16 +1,24 @@
 """Main application for BlinkBridge RTSP streaming service.
 
-Manages the lifecycle of camera streams, monitors for motion detection,
-and handles stream failures and restarts. Provides graceful shutdown handling.
+Manages the lifecycle of camera streams with four states:
+- INITIALIZING: Stream just created, showing initializing overlay
+- WAITING: Camera online, waiting for first fresh clip
+- STREAMING: Camera online, showing real video clips
+- OFFLINE: Camera offline, showing offline overlay
+
+No stale clips are used at startup. All cameras start as INITIALIZING,
+transition to WAITING (online) or OFFLINE, and only accept clips
+recorded after the bridge started.
 """
 import asyncio
 import logging
 import signal
-from collections import defaultdict
 from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
 from typing import Dict, Optional
 
-from rich.highlighter import JSONHighlighter, NullHighlighter
+from rich.highlighter import NullHighlighter
 from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
@@ -29,18 +37,26 @@ LOG_INTERVAL_SECONDS = 30
 SHUTDOWN_GRACE_PERIOD = 0.2
 
 
+class CameraState(Enum):
+    """Lifecycle states for camera streams."""
+    INITIALIZING = "initializing"
+    WAITING = "waiting"
+    STREAMING = "streaming"
+    OFFLINE = "offline"
+
+
 class Application:
     """Main application that manages camera streams and monitors for motion.
     
     Coordinates CameraManager and StreamServer instances for each camera,
     handles motion detection polling, stream failures, and restarts.
-    Periodically scans for new cameras that come online.
+    Periodically scans for camera changes and handles online/offline transitions.
     
-    Attributes:
-        stream_servers: Dict mapping camera names to StreamServer instances
-        cam_manager: CameraManager instance for Blink integration
-        running: Boolean flag indicating if application should continue running
-        disabled_cameras: Set of cameras that hit max failures and were disabled
+    Camera lifecycle:
+        INITIALIZING → WAITING (if online) or OFFLINE (if offline)
+        WAITING → STREAMING (when fresh clip arrives)
+        STREAMING → OFFLINE (if camera goes offline)
+        OFFLINE → WAITING (when camera comes back online)
     """
     
     def __init__(self) -> None:
@@ -48,45 +64,30 @@ class Application:
         self.cam_manager: Optional[CameraManager] = None
         self.running: bool = False
         self.disabled_cameras: set = set()
+        self.camera_states: Dict[str, CameraState] = {}
+        self.bridge_start_time: Optional[datetime] = None
+        # Per-camera freshness threshold — clips must be newer than this
+        self.freshness_threshold: Dict[str, datetime] = {}
+        # Consecutive scans a camera has been absent from API
+        self.removal_counter: Dict[str, int] = {}
 
-    async def start_stream(self, camera_name: str, redownload: bool=False) -> Optional[StreamServer]:
-        """Start a stream server for a camera.
+    def _start_stream_server(self, camera_name: str, video_path: Path) -> Optional[StreamServer]:
+        """Create and start a StreamServer for a camera with a given video.
         
         Args:
             camera_name: Name of the camera
-            redownload: Whether to force redownload of the latest clip (default: False)
+            video_path: Path to the initial video to stream
             
         Returns:
             StreamServer instance if successful, None if failed
-            
-        Note:
-            If no clip is available, may return a stream with black placeholder
-            video for cameras that have never had clips.
         """
         if not self.running:
             log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
             return None
-            
-        if redownload:
-            await self.cam_manager.refresh_metadata()
-
-        file_name_initial_video = await self.cam_manager.save_latest_clip(camera_name, force=redownload)
-
-        if file_name_initial_video is None:
-            log.error(f"{camera_name}: cannot start stream (no video available)")
-            return None
-
-        if not self.running:
-            log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
-            return None
-
-        is_placeholder = camera_name in self.cam_manager.cameras_without_clips
-        status = "black placeholder (waiting for first clip)" if is_placeholder else "real clip"
-        log.info(f"{camera_name}: starting stream with {status}")
         
         try:
             stream_server = StreamServer(camera_name)
-            stream_server.start_server(file_name_initial_video)
+            stream_server.start_server(video_path)
             self.stream_servers[camera_name] = stream_server
             return stream_server
         except Exception as e:
@@ -94,81 +95,65 @@ class Application:
             return None
 
     async def check_for_motion(self, camera_name: str) -> bool:
-        """Check for motion on a camera and add new clip to stream if detected.
+        """Check for motion on a streaming camera and add new clip if detected.
         
-        Args:
-            camera_name: Name of the camera to check
-            
         Returns:
             True if motion was detected and clip added, False otherwise
         """
         try:
             ss = self.stream_servers.get(camera_name)
-            if not ss:
-                log.warning(f"{camera_name}: stream server not found")
-                return False
-
-            if not ss.is_running():
-                log.debug(f"{camera_name}: stream server not running")
+            if not ss or not ss.is_running():
                 return False
             
             file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
-
             if not file_name_new_clip:
                 return False
 
-            log.debug(f"{ss.stream_name}: adding new clip to stream")
+            log.debug(f"{camera_name}: adding new clip to stream")
             ss.add_video(file_name_new_clip)
             return True
         except Exception as e:
             log.error(f"{camera_name}: error in check_for_motion: {e}", exc_info=True)
             return False
     
-    async def check_for_first_clip(self, camera_name: str) -> bool:
-        """Check if a camera without clips now has its first clip available.
+    async def _check_waiting_camera(self, camera_name: str) -> bool:
+        """Check if a WAITING camera now has a fresh clip available.
         
-        Args:
-            camera_name: Name of the camera to check
-            
+        Only accepts clips recorded after the camera's freshness threshold
+        (bridge_start_time at startup, or offline_detection_time for cameras
+        coming back online).
+        
         Returns:
-            True if first clip is now available and was added, False otherwise
-            
-        Note:
-            Only checks cameras that are in cameras_without_clips set.
-            Once a clip is found, upgrades the stream from black placeholder.
+            True if fresh clip found and stream upgraded, False otherwise
         """
         try:
-            if camera_name not in self.cam_manager.cameras_without_clips:
-                return False
-            
             ss = self.stream_servers.get(camera_name)
             if not ss or not ss.is_running():
-                log.debug(f"{camera_name}: stream not running when checking for first clip")
                 return False
             
-            await self.cam_manager.refresh_metadata()
-            file_name = await self.cam_manager.save_latest_clip(camera_name, force=True, use_black_fallback=False)
+            threshold = self.freshness_threshold.get(camera_name, self.bridge_start_time)
+            file_name = await self.cam_manager.save_latest_clip(camera_name, since=threshold)
             
             if file_name:
-                log.info(f"{camera_name}: first clip now available, upgrading from black placeholder")
                 ss.add_video(file_name)
+                # Sync last_record so check_for_motion doesn't re-trigger on same clip
+                camera = self.cam_manager.blink.cameras.get(camera_name)
+                if camera:
+                    self.cam_manager.camera_last_record[camera_name] = camera.last_record
+                self.camera_states[camera_name] = CameraState.STREAMING
+                log.info(f"{camera_name}: first fresh clip received, now STREAMING")
                 return True
             
             return False
         except Exception as e:
             log.error(f"{camera_name}: error checking for first clip: {e}", exc_info=True)
             return False
-        
+
     async def start(self) -> None:
-        """Start the application, initialize cameras, and begin monitoring.
-        
-        Raises:
-            LoginError: If Blink authentication fails
-            TokenRefreshFailed: If Blink token refresh fails
-            Exception: For other critical initialization errors
-        """
+        """Start the application, initialize cameras, and begin monitoring."""
         try:
             self.running = True
+            self.bridge_start_time = datetime.utcnow()
             log.info("Detecting FFmpeg hardware acceleration...")
             encoder = init_encoder(CONFIG.get('ffmpeg', {}).get('encoder', 'auto'))
             log.info(f"Encoder: {encoder.name} ({'hardware' if encoder.is_hardware else 'software'})")
@@ -201,47 +186,84 @@ class Application:
     def _get_enabled_cameras(self) -> set:
         """Get the set of enabled cameras from config.
         
-        Returns:
-            Set of camera names that should be monitored
-            
-        Note:
-            If CONFIG['cameras']['enabled'] is empty, enables all discovered cameras.
-            Always excludes cameras in CONFIG['cameras']['disabled'].
+        If CONFIG['cameras']['enabled'] is empty, enables all discovered cameras.
+        Always excludes cameras in CONFIG['cameras']['disabled'].
         """
+        all_cameras = self.cam_manager.get_all_cameras()
         if CONFIG['cameras']['enabled']:
             enabled_cameras = set(CONFIG['cameras']['enabled'])
         else:
-            enabled_cameras = set(self.cam_manager.get_cameras())
+            enabled_cameras = set(all_cameras)
         
-        return enabled_cameras - set(CONFIG['cameras']['disabled'])
+        disabled_config = set(CONFIG['cameras']['disabled'])
+        result = enabled_cameras - disabled_config
+        log.debug(f'All cameras: {all_cameras} ({len(all_cameras)}), Enabled: {result} ({len(result)})')
+        return result
     
     async def _initialize_camera_streams(self, enabled_cameras: set) -> None:
         """Create stream servers for all enabled cameras.
         
-        Args:
-            enabled_cameras: Set of camera names to initialize
-            
-        Note:
-            Initializes failure tracking attributes on each StreamServer:
-            - failure_count: Number of times stream has failed
-            - datetime_started: When the stream was last started
+        Phase 1: Start ALL cameras with 'Initializing' overlay.
+        Phase 2: Check per-camera status → swap to WAITING or OFFLINE overlay.
+        
+        No clips are fetched at startup. Clips only arrive via motion polling.
         """
-        for camera in self.cam_manager.get_cameras():
+        init_video = self.cam_manager.get_initializing_video()
+        if not init_video:
+            log.error("Cannot generate 'Initializing' overlay — cannot start streams")
+            return
+        
+        # Phase 1: Start ALL cameras with "Initializing" overlay
+        log.info(f"Phase 1: Starting {len(enabled_cameras)} camera stream(s) with 'Initializing' overlay")
+        for camera in enabled_cameras:
             if not self.running:
-                log.info("Shutdown requested during startup, stopping stream creation")
-                break
-                
-            if camera not in enabled_cameras:
-                continue
+                return
             
-            ss = await self.start_stream(camera)
+            ss = self._start_stream_server(camera, init_video)
             if ss is None:
                 log.warning(f"{camera}: failed to start stream")
                 continue
             
             ss.failure_count = 0
             ss.datetime_started = datetime.now()
+            self.camera_states[camera] = CameraState.INITIALIZING
+            self.freshness_threshold[camera] = self.bridge_start_time
             await asyncio.sleep(0)
+        
+        # Phase 2: Check status and transition to WAITING or OFFLINE
+        online_count = 0
+        offline_count = 0
+        now_str = datetime.now().strftime("%m/%d/%Y %H:%M")
+        
+        log.info("Phase 2: Checking camera status...")
+        for camera in list(self.camera_states.keys()):
+            if not self.running:
+                return
+            
+            ss = self.stream_servers.get(camera)
+            if not ss:
+                continue
+            
+            if self.cam_manager.is_camera_online(camera):
+                waiting_video = self.cam_manager.get_waiting_video()
+                if waiting_video:
+                    try:
+                        ss.add_video(waiting_video)
+                    except Exception as e:
+                        log.error(f"{camera}: failed to swap to waiting overlay: {e}")
+                self.camera_states[camera] = CameraState.WAITING
+                online_count += 1
+            else:
+                offline_video = self.cam_manager.get_offline_video(now_str)
+                if offline_video:
+                    try:
+                        ss.add_video(offline_video)
+                    except Exception as e:
+                        log.error(f"{camera}: failed to swap to offline overlay: {e}")
+                self.camera_states[camera] = CameraState.OFFLINE
+                offline_count += 1
+        
+        log.info(f"Camera status: {online_count} online (WAITING), {offline_count} offline")
     
     async def _monitor_cameras(self) -> None:
         """Main monitoring loop for camera motion detection.
@@ -289,35 +311,49 @@ class Application:
             await asyncio.sleep(CONFIG['blink']['poll_interval'])
     
     def _log_camera_status(self, poll_count: int) -> None:
-        """Log periodic status summary of cameras.
-        
-        Args:
-            poll_count: Current poll iteration number
-        """
-        active_cams = len(self.stream_servers) - len(self.cam_manager.cameras_without_clips)
-        waiting_cams = len(self.cam_manager.cameras_without_clips)
-        disabled_cams = len(self.disabled_cameras)
+        """Log periodic status summary of cameras."""
+        counts = {s: 0 for s in CameraState}
+        for s in self.camera_states.values():
+            counts[s] += 1
         log.debug(
-            f"Poll #{poll_count}: {active_cams} cameras active, "
-            f"{waiting_cams} waiting for first clip, "
-            f"{disabled_cams} disabled"
+            f"Poll #{poll_count}: "
+            f"{counts[CameraState.STREAMING]} streaming, "
+            f"{counts[CameraState.WAITING]} waiting, "
+            f"{counts[CameraState.INITIALIZING]} initializing, "
+            f"{counts[CameraState.OFFLINE]} offline, "
+            f"{len(self.disabled_cameras)} disabled"
         )
     
     async def _check_cameras_for_updates(self) -> None:
-        """Check all cameras for motion or first clip availability.
+        """Check cameras for motion or fresh clip availability.
         
-        For cameras without clips, checks if first clip is now available.
-        For cameras with clips, checks for new motion events.
-        Closes streams that encounter errors.
+        - WAITING cameras: check for fresh clips (newer than freshness threshold)
+        - STREAMING cameras: check for new motion events
+        - OFFLINE/INITIALIZING: skipped
         """
+        # Refresh metadata once per poll cycle for WAITING cameras
+        has_waiting = any(
+            s == CameraState.WAITING for s in self.camera_states.values()
+        )
+        if has_waiting:
+            try:
+                await self.cam_manager.refresh_metadata()
+            except Exception as e:
+                log.error(f"Failed to refresh metadata: {e}")
+        
         for camera_name in list(self.stream_servers.keys()):
             if not self.running:
                 break
+            
+            state = self.camera_states.get(camera_name)
+            
+            if state in (CameraState.OFFLINE, CameraState.INITIALIZING):
+                continue
+            
             try:
-                if camera_name in self.cam_manager.cameras_without_clips:
-                    log.debug(f"{camera_name}: checking for first clip...")
-                    await self.check_for_first_clip(camera_name)
-                else:
+                if state == CameraState.WAITING:
+                    await self._check_waiting_camera(camera_name)
+                elif state == CameraState.STREAMING:
                     await self.check_for_motion(camera_name)
             except Exception as e:
                 log.error(f"{camera_name}: critical error checking for updates: {e}", exc_info=True)
@@ -326,14 +362,13 @@ class Application:
                     if ss:
                         ss.close()
                 except Exception as close_err:
-                    log.error(f"{camera_name}: error closing stream after update failure: {close_err}")
+                    log.error(f"{camera_name}: error closing stream: {close_err}")
     
     async def _restart_failed_streams(self) -> None:
         """Restart any failed stream servers.
         
-        Checks each stream server's health and attempts restart if needed.
-        Disables cameras that exceed maximum failure count.
-        Respects restart delay between attempts.
+        Non-streaming states restart with the appropriate overlay (no failure penalty).
+        Streaming cameras attempt clip re-download on restart.
         """
         for camera_name in list(self.stream_servers.keys()):
             if not self.running:
@@ -344,73 +379,193 @@ class Application:
                 if ss.is_running():
                     continue
                 
+                state = self.camera_states.get(camera_name)
+                
+                # Non-streaming states: restart with overlay, no failure penalty
+                if state in (CameraState.OFFLINE, CameraState.WAITING, CameraState.INITIALIZING):
+                    overlay = None
+                    if state == CameraState.OFFLINE:
+                        overlay = self.cam_manager.get_offline_video(
+                            datetime.now().strftime("%m/%d/%Y %H:%M")
+                        )
+                    elif state == CameraState.WAITING:
+                        overlay = self.cam_manager.get_waiting_video()
+                    elif state == CameraState.INITIALIZING:
+                        overlay = self.cam_manager.get_initializing_video()
+                    
+                    if overlay:
+                        ss_new = self._start_stream_server(camera_name, overlay)
+                        if ss_new:
+                            ss_new.failure_count = 0
+                            ss_new.datetime_started = datetime.now()
+                            log.info(f"{camera_name}: {state.value} stream restarted")
+                    continue
+                
+                # STREAMING state: count failures, attempt re-download
                 if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
                     log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
                     self.disabled_cameras.add(camera_name)
-                    try:
-                        self.stream_servers.pop(camera_name)
-                    except KeyError:
-                        log.debug(f"{camera_name}: already removed from stream servers")
+                    self.camera_states.pop(camera_name, None)
+                    self.stream_servers.pop(camera_name, None)
                     continue
 
                 log.warning(f"{camera_name}: server failed {ss.failure_count + 1} time(s)")
 
                 if datetime.now() < ss.datetime_started + DELAY_RESTART:
-                    log.debug(f"{camera_name}: waiting for restart delay to elapse")
                     continue
 
-                ss_new = await self.start_stream(camera_name, redownload=True)
-                if ss_new is None:
-                    log.debug(f"{camera_name}: restart failed, will retry later")
-                    ss.datetime_started = datetime.now()
-                    continue
+                # Try to restart with a real clip
+                await self.cam_manager.refresh_metadata()
+                file_name = await self.cam_manager.save_latest_clip(camera_name)
+                if file_name:
+                    ss_new = self._start_stream_server(camera_name, file_name)
+                    if ss_new:
+                        ss_new.failure_count = ss.failure_count + 1
+                        ss_new.datetime_started = datetime.now()
+                        self.camera_states[camera_name] = CameraState.STREAMING
+                        log.info(f"{camera_name}: streaming restarted")
+                        continue
                 
-                ss_new.failure_count = ss.failure_count + 1
-                ss_new.datetime_started = datetime.now()
-                log.info(f"{camera_name}: stream restarted successfully")
+                # Fallback: restart as WAITING
+                waiting_video = self.cam_manager.get_waiting_video()
+                if waiting_video:
+                    ss_new = self._start_stream_server(camera_name, waiting_video)
+                    if ss_new:
+                        ss_new.failure_count = ss.failure_count + 1
+                        ss_new.datetime_started = datetime.now()
+                        self.camera_states[camera_name] = CameraState.WAITING
+                        log.info(f"{camera_name}: restarted as WAITING (clip unavailable)")
             except Exception as e:
                 log.error(f"{camera_name}: error during stream restart: {e}", exc_info=True)
 
     async def _discover_new_cameras(self) -> None:
-        """Scan for new cameras and start streams for any not currently managed.
+        """Scan for camera changes and handle state transitions.
         
-        Calls BlinkPy's setup_post_verify() to re-enumerate all cameras,
-        then starts streams for any new cameras that pass the enabled/disabled
-        filter and aren't already running. Also retries previously disabled
-        cameras (those that hit max_failures), giving them a fresh start.
+        1. Re-enumerates all cameras
+        2. Tracks camera removal via removal_counter
+        3. Handles online/offline transitions for existing streams
+        4. Starts streams for newly discovered cameras
+        5. Retries previously disabled cameras
         """
         try:
-            log.debug("Scanning for new cameras...")
-            all_cameras = await self.cam_manager.refresh_cameras()
-            await self.cam_manager.refresh_metadata()
-            
+            log.debug("Scanning for camera changes...")
+            await self.cam_manager.refresh_cameras()
+            all_cameras = self.cam_manager.get_all_cameras()
             enabled_cameras = self._get_enabled_cameras()
+            running_cameras = set(self.stream_servers.keys())
+            removal_scans = CONFIG['cameras'].get('removal_scans', 3)
             
-            cameras_to_start = enabled_cameras - set(self.stream_servers.keys())
+            log.debug(f'All cameras: {all_cameras} ({len(all_cameras)}), '
+                      f'Running: {running_cameras} ({len(running_cameras)})')
+            
+            # --- Handle removal detection ---
+            vanished = running_cameras - all_cameras
+            for camera_name in vanished:
+                self.removal_counter[camera_name] = self.removal_counter.get(camera_name, 0) + 1
+                count = self.removal_counter[camera_name]
+                if count >= removal_scans:
+                    log.warning(f"{camera_name}: absent from API for {count} consecutive scans, removing stream")
+                    ss = self.stream_servers.pop(camera_name, None)
+                    if ss:
+                        ss.close()
+                    self.camera_states.pop(camera_name, None)
+                    self.freshness_threshold.pop(camera_name, None)
+                    self.removal_counter.pop(camera_name, None)
+                else:
+                    log.debug(f"{camera_name}: absent from API ({count}/{removal_scans} scans)")
+            
+            # Reset removal counter for cameras that reappeared
+            for camera_name in list(self.removal_counter.keys()):
+                if camera_name in all_cameras:
+                    self.removal_counter.pop(camera_name, None)
+            
+            # --- Handle state transitions for existing streams ---
+            now_str = datetime.now().strftime("%m/%d/%Y %H:%M")
+            
+            for camera_name in list(running_cameras & enabled_cameras & all_cameras):
+                if not self.running:
+                    return
+                
+                current_state = self.camera_states.get(camera_name)
+                is_online = self.cam_manager.is_camera_online(camera_name)
+                ss = self.stream_servers.get(camera_name)
+                if not ss:
+                    continue
+                
+                # Transition: was online (STREAMING/WAITING) → now offline
+                if not is_online and current_state in (CameraState.STREAMING, CameraState.WAITING):
+                    log.info(f"{camera_name}: went OFFLINE")
+                    offline_video = self.cam_manager.get_offline_video(now_str)
+                    if offline_video:
+                        try:
+                            ss.add_video(offline_video)
+                            self.camera_states[camera_name] = CameraState.OFFLINE
+                        except Exception as e:
+                            log.error(f"{camera_name}: failed to swap to offline overlay: {e}")
+                
+                # Transition: was offline → now online
+                elif is_online and current_state == CameraState.OFFLINE:
+                    log.info(f"{camera_name}: came back ONLINE, transitioning to WAITING")
+                    self.freshness_threshold[camera_name] = datetime.utcnow()
+                    waiting_video = self.cam_manager.get_waiting_video()
+                    if waiting_video:
+                        try:
+                            ss.add_video(waiting_video)
+                            self.camera_states[camera_name] = CameraState.WAITING
+                        except Exception as e:
+                            log.error(f"{camera_name}: failed to swap to waiting overlay: {e}")
+            
+            # --- Start streams for new cameras ---
+            cameras_to_start = (enabled_cameras - running_cameras) & all_cameras
             if not cameras_to_start:
+                log.debug('No new cameras to start')
                 return
             
-            # Log retried vs truly new cameras separately
             retried = cameras_to_start & self.disabled_cameras
             new = cameras_to_start - self.disabled_cameras
             if new:
-                log.info(f"Found {len(new)} new camera(s) to start: {new}")
+                log.info(f"Found {len(new)} new camera(s): {new}")
             if retried:
                 log.info(f"Retrying {len(retried)} previously disabled camera(s): {retried}")
+            
+            init_video = self.cam_manager.get_initializing_video()
+            if not init_video:
+                log.error("Cannot generate 'Initializing' overlay for new cameras")
+                return
             
             for camera_name in cameras_to_start:
                 if not self.running:
                     break
                 
                 self.disabled_cameras.discard(camera_name)
+                self.freshness_threshold[camera_name] = datetime.utcnow()
                 
-                ss = await self.start_stream(camera_name)
+                ss = self._start_stream_server(camera_name, init_video)
                 if ss is None:
-                    log.warning(f"{camera_name}: failed to start stream for camera")
                     continue
                 
                 ss.failure_count = 0
                 ss.datetime_started = datetime.now()
+                self.camera_states[camera_name] = CameraState.INITIALIZING
+                
+                # Immediately resolve to WAITING or OFFLINE
+                if self.cam_manager.is_camera_online(camera_name):
+                    waiting_video = self.cam_manager.get_waiting_video()
+                    if waiting_video:
+                        try:
+                            ss.add_video(waiting_video)
+                            self.camera_states[camera_name] = CameraState.WAITING
+                        except Exception as e:
+                            log.error(f"{camera_name}: failed to set waiting overlay: {e}")
+                else:
+                    offline_video = self.cam_manager.get_offline_video(now_str)
+                    if offline_video:
+                        try:
+                            ss.add_video(offline_video)
+                            self.camera_states[camera_name] = CameraState.OFFLINE
+                        except Exception as e:
+                            log.error(f"{camera_name}: failed to set offline overlay: {e}")
+                
                 await asyncio.sleep(0)
         except Exception as e:
             log.error(f"Error during camera discovery: {e}", exc_info=True)
