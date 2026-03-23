@@ -13,6 +13,7 @@ import sys
 import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
+from uuid import uuid4
 
 from blinkbridge.config import *
 from blinkbridge.hwaccel import get_encoder
@@ -391,7 +392,7 @@ class StillVideoCreator:
         still_image_file_name = None
         try:
             log.debug(f"Creating still video from {file_name_input_video}")
-            still_image_file_name = PATH_VIDEOS / 'last_frame.jpg'
+            still_image_file_name = PATH_VIDEOS / f'last_frame_{uuid4().hex}.jpg'
             # Extract last frame from source video
             lfg = VideoToLastFrame(file_name_input_video, still_image_file_name)
             # Get stream parameters from source

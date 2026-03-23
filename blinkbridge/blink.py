@@ -440,12 +440,6 @@ class CameraManager:
             searches for the most recent actual clip in the recent_clips list.
         """
         try:
-            await self.blink.refresh()
-        except Exception as e:
-            log.error(f"{camera_name}: failed to refresh Blink data: {e}")
-            raise
-            
-        try:
             camera = self.blink.cameras[camera_name]
         except KeyError:
             log.error(f"{camera_name}: camera not found in Blink cameras")
