@@ -6,6 +6,7 @@ downloading video clips, and monitoring for motion detection events.
 import asyncio
 import json
 import logging
+import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,11 +25,11 @@ from blinkbridge.hwaccel import get_encoder
 log = logging.getLogger(__name__)
 
 
-def find_most_recent_clip_url(recent_clips: dict, date: str) -> str:
+def find_most_recent_clip_url(recent_clips: list, date: str) -> str:
     """Find the most recent non-snapshot clip URL that is newer than the given date.
     
     Args:
-        recent_clips: Dictionary of recent clips from Blink camera
+        recent_clips: List of recent clip dicts from Blink camera
         date: ISO format date string to compare against
         
     Returns:
@@ -164,7 +165,6 @@ class CameraManager:
         Returns:
             Path to the generated overlay video, or None if generation failed
         """
-        import subprocess
         
         if cache_key and cache_key in self._overlay_cache:
             cached = self._overlay_cache[cache_key]
@@ -292,7 +292,7 @@ class CameraManager:
         """
         try:
             log.debug('refreshing video metadata')
-            dt_past = datetime.now() - timedelta(days=CONFIG['blink']['history_days'])
+            dt_past = datetime.now(timezone.utc) - timedelta(days=CONFIG['blink']['history_days'])
             stop = CONFIG['blink']['metadata_pages'] + 1  # BlinkPy uses range(1, stop)
             self.metadata = await self.blink.get_videos_metadata(since=str(dt_past), stop=stop)
             count = len(self.metadata) if self.metadata else 0
@@ -641,11 +641,11 @@ class CameraManager:
         """Get set of camera names that are currently offline."""
         return {name for name in self.all_camera_names if not self.is_camera_online(name)}
 
-    def get_cameras(self) -> iter:
-        """Get iterator of all available camera names.
+    def get_cameras(self) -> set:
+        """Get all available camera names.
         
         Returns:
-            Iterator of camera name strings
+            Set of camera name strings
         """
         return self.all_camera_names
 

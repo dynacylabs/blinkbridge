@@ -29,6 +29,8 @@ class StreamServer:
         stream_name_sanitized: URL-safe version of stream name
         current_still_video: Path to the current still video file
         process: FFmpeg subprocess handle
+        failure_count: Number of consecutive stream failures
+        datetime_started: When this stream server was last started
     """
     
     def __init__(self, stream_name: str):
@@ -41,6 +43,8 @@ class StreamServer:
         self.stream_name_sanitized: str = stream_name.replace(' ', '_').lower()
         self.current_still_video: Optional[Path] = None
         self.process: Optional[subprocess.Popen] = None
+        self.failure_count: int = 0
+        self.datetime_started: Optional[datetime] = None
 
     def _run_server(self) -> str:
         """Start the FFmpeg RTSP streaming process.
@@ -245,7 +249,6 @@ class StreamServer:
 
             if self.current_still_video and not still_only:
                 try:
-                    pass  # Delete old still video silently
                     self.current_still_video.unlink()
                 except OSError as e:
                     log.warning(f"{self.stream_name}: failed to delete old still video: {e}")
@@ -254,7 +257,7 @@ class StreamServer:
             
             self.current_still_video = next_still_video
         except Exception as e:
-            log.error(f"{self.stream_name}: Failed to create still video from {video_file}: {e}", exc_info=True)
+            log.error(f"{self.stream_name}: Failed to create still video from {file_name_input_video}: {e}", exc_info=True)
             try:
                 if next_still_video.exists():
                     next_still_video.unlink()  # Clean up failed still video

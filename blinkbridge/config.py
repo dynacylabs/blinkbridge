@@ -162,4 +162,3 @@ try:
 except Exception as e:
     print(f"\nFATAL ERROR: Failed to load configuration: {e}\n", file=sys.stderr)
     sys.exit(1)
- 

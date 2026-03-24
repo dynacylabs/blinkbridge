@@ -2,6 +2,8 @@ services:
   blinkbridge:
     build: .
     # image: rogerdammit/blinkbridge
+    depends_on:
+      - mediamtx
     volumes:
       - ./config:/config
       # path for temporary files (video clips, concat files, etc.)
