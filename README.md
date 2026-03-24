@@ -63,7 +63,7 @@ Edit `config.json` with the following settings:
 - `blink.login.username` - Your Blink account email
 - `blink.login.password` - Your Blink account password
 - `blink.history_days` - Days to look back in history (default: `90`)
-- `blink.poll_interval` - Polling interval in minutes (default: `1`, minimum recommended)
+- `blink.poll_interval` - Polling interval in seconds (default: `1`, minimum recommended)
 - `blink.metadata_pages` - Number of API pages to fetch for video metadata, ~25 clips per page (default: `10`)
 
 **RTSP Server:**
@@ -103,7 +103,7 @@ rtsp://192.168.1.100:8554/Front_Door   # Network access
 
 ## TODO
 
-- [ ] Process cameras in parallel and reduce latency
+- [x] Process cameras in parallel and reduce latency
 - [ ] Add ONVIF server with motion events
 
 ## Related Projects

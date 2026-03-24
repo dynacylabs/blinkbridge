@@ -354,7 +354,7 @@ class Application:
         counts = {s: 0 for s in CameraState}
         for s in self.camera_states.values():
             counts[s] += 1
-        log.debug(
+        log.info(
             f"Poll #{poll_count}: "
             f"{counts[CameraState.STREAMING]} streaming, "
             f"{counts[CameraState.WAITING]} waiting, "
@@ -476,7 +476,8 @@ class Application:
                 return
 
             # Try to restart with a real clip
-            file_name = await self.cam_manager.save_latest_clip(camera_name)
+            async with self._download_semaphore:
+                file_name = await self.cam_manager.save_latest_clip(camera_name)
             if file_name:
                 ss_new = self._start_stream_server(camera_name, file_name)
                 if ss_new:
@@ -666,7 +667,7 @@ class Application:
     async def close(self) -> None:
         """Close the application and stop all streams.
         
-        Stops all  stream servers, waits for graceful FFmpeg shutdown,
+        Stops all stream servers, waits for graceful FFmpeg shutdown,
         and closes the camera manager connection.
         """
         log.info("Closing application and stopping all streams...")
