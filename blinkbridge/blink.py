@@ -436,6 +436,8 @@ class CameraManager:
             Path to the downloaded clip file, or None if no new motion detected
             
         Note:
+            Caller must have called ``blink.refresh()`` before invoking this
+            method so that ``camera.attributes`` reflects current state.
             Handles both regular video clips and snapshot events. For snapshots,
             searches for the most recent actual clip in the recent_clips list.
         """

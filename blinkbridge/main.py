@@ -70,6 +70,8 @@ class Application:
         self.freshness_threshold: Dict[str, datetime] = {}
         # Consecutive scans a camera has been absent from API
         self.removal_counter: Dict[str, int] = {}
+        # Limit concurrent download/FFmpeg operations
+        self._download_semaphore = asyncio.Semaphore(4)
 
     def _start_stream_server(self, camera_name: str, video_path: Path) -> Optional[StreamServer]:
         """Create and start a StreamServer for a camera with a given video.
@@ -105,12 +107,16 @@ class Application:
             if not ss or not ss.is_running():
                 return False
             
-            file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
-            if not file_name_new_clip:
-                return False
+            async with self._download_semaphore:
+                file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
+                if not file_name_new_clip:
+                    return False
 
-            log.debug(f"{camera_name}: adding new clip to stream")
-            await asyncio.to_thread(ss.add_video, file_name_new_clip)
+                if not self.running:
+                    return False
+
+                log.debug(f"{camera_name}: adding new clip to stream")
+                await asyncio.to_thread(ss.add_video, file_name_new_clip)
             return True
         except Exception as e:
             log.error(f"{camera_name}: error in check_for_motion: {e}", exc_info=True)
@@ -132,9 +138,12 @@ class Application:
                 return False
             
             threshold = self.freshness_threshold.get(camera_name, self.bridge_start_time)
-            file_name = await self.cam_manager.save_latest_clip(camera_name, since=threshold)
+            async with self._download_semaphore:
+                file_name = await self.cam_manager.save_latest_clip(camera_name, since=threshold)
             
             if file_name:
+                if not self.running:
+                    return False
                 await asyncio.to_thread(ss.add_video, file_name)
                 # Sync last_record so check_for_motion doesn't re-trigger on same clip
                 camera = self.cam_manager.blink.cameras.get(camera_name)
@@ -365,9 +374,11 @@ class Application:
                 log.error(f"Failed to refresh metadata: {e}")
 
         # Single blink.refresh() per poll cycle for STREAMING cameras
+        blink_refreshed = False
         if has_streaming:
             try:
                 await self.cam_manager.blink.refresh()
+                blink_refreshed = True
             except Exception as e:
                 log.error(f"Failed to refresh Blink data: {e}")
 
@@ -379,6 +390,9 @@ class Application:
             state = self.camera_states.get(camera_name)
             if state in (CameraState.OFFLINE, CameraState.INITIALIZING):
                 continue
+            # Skip STREAMING checks if blink.refresh() failed — data is stale
+            if state == CameraState.STREAMING and not blink_refreshed:
+                continue
             tasks.append(self._check_single_camera(camera_name))
 
         if tasks:
@@ -386,6 +400,8 @@ class Application:
     
     async def _restart_single_stream(self, camera_name: str) -> None:
         """Restart a single failed stream server."""
+        if not self.running:
+            return
         try:
             ss = self.stream_servers[camera_name]
             if ss.is_running():
@@ -424,6 +440,9 @@ class Application:
             log.warning(f"{camera_name}: server failed {ss.failure_count + 1} time(s)")
 
             if datetime.now() < ss.datetime_started + DELAY_RESTART:
+                return
+
+            if not self.running:
                 return
 
             # Try to restart with a real clip
