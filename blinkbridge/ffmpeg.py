@@ -8,8 +8,10 @@ Provides classes for interacting with FFmpeg and FFprobe to:
 """
 import json
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -391,7 +393,9 @@ class StillVideoCreator:
         still_image_file_name = None
         try:
             log.debug(f"Creating still video from {file_name_input_video}")
-            still_image_file_name = PATH_VIDEOS / 'last_frame.jpg'
+            fd, tmp_path = tempfile.mkstemp(suffix='.jpg', prefix='last_frame_', dir=PATH_VIDEOS)
+            os.close(fd)
+            still_image_file_name = Path(tmp_path)
             # Extract last frame from source video
             lfg = VideoToLastFrame(file_name_input_video, still_image_file_name)
             # Get stream parameters from source
