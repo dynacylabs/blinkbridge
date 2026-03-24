@@ -72,6 +72,8 @@ class Application:
         self.removal_counter: Dict[str, int] = {}
         # Limit concurrent download/FFmpeg operations
         self._download_semaphore = asyncio.Semaphore(4)
+        # Track outstanding add_video executor futures for graceful shutdown
+        self._pending_add_videos: set = set()
 
     def _start_stream_server(self, camera_name: str, video_path: Path) -> Optional[StreamServer]:
         """Create and start a StreamServer for a camera with a given video.
@@ -96,6 +98,21 @@ class Application:
             log.error(f"{camera_name}: failed to start stream server: {e}")
             return None
 
+    async def _tracked_add_video(self, ss: StreamServer, file_name: Path) -> None:
+        """Run add_video in a background thread, safe from task cancellation.
+
+        Tracks the executor future so close() can wait for it to finish
+        before tearing down stream servers.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, ss.add_video, file_name)
+        self._pending_add_videos.add(fut)
+        fut.add_done_callback(self._pending_add_videos.discard)
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            pass  # Executor job continues; close() will await it
+
     async def check_for_motion(self, camera_name: str) -> bool:
         """Check for motion on a streaming camera and add new clip if detected.
         
@@ -116,7 +133,7 @@ class Application:
                     return False
 
                 log.debug(f"{camera_name}: adding new clip to stream")
-                await asyncio.to_thread(ss.add_video, file_name_new_clip)
+                await self._tracked_add_video(ss, file_name_new_clip)
             return True
         except Exception as e:
             log.error(f"{camera_name}: error in check_for_motion: {e}", exc_info=True)
@@ -144,7 +161,7 @@ class Application:
             if file_name:
                 if not self.running:
                     return False
-                await asyncio.to_thread(ss.add_video, file_name)
+                await self._tracked_add_video(ss, file_name)
                 # Sync last_record so check_for_motion doesn't re-trigger on same clip
                 camera = self.cam_manager.blink.cameras.get(camera_name)
                 if camera:
@@ -158,8 +175,21 @@ class Application:
             log.error(f"{camera_name}: error checking for first clip: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def _cleanup_temp_frames() -> None:
+        """Remove orphaned last_frame_*.jpg temp files from previous runs."""
+        try:
+            for f in PATH_VIDEOS.glob('last_frame_*.jpg'):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
     async def start(self) -> None:
         """Start the application, initialize cameras, and begin monitoring."""
+        self._cleanup_temp_frames()
         try:
             self.running = True
             self.bridge_start_time = datetime.now(timezone.utc)
@@ -642,6 +672,11 @@ class Application:
         log.info("Closing application and stopping all streams...")
         log.info("Note: FFmpeg 'Broken pipe' errors during shutdown are normal")
         self.running = False
+
+        # Wait for outstanding add_video operations to finish before closing streams
+        if self._pending_add_videos:
+            log.debug(f"Waiting for {len(self._pending_add_videos)} pending add_video operation(s)...")
+            await asyncio.gather(*list(self._pending_add_videos), return_exceptions=True)
 
         for camera_name, ss in list(self.stream_servers.items()):
             try:
