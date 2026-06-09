@@ -2,6 +2,8 @@ services:
   blinkbridge:
     build: .
     # image: rogerdammit/blinkbridge
+    ports:
+      - 8765:8765
     volumes:
       - ./config:/config
       # path for temporary files (video clips, concat files, etc.)

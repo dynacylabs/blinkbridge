@@ -137,6 +137,24 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['cameras'].setdefault('max_failures', 3)
         CONFIG['blink'].setdefault('history_days', 90)
         CONFIG['blink'].setdefault('poll_interval', 1)
+
+        # Optional export of Frigate cameras block (snippet only)
+        CONFIG.setdefault('frigate_export', {})
+        CONFIG['frigate_export'].setdefault('enabled', False)
+        CONFIG['frigate_export'].setdefault('output_path', str(PATH_CONFIG / 'frigate_cameras.yml'))
+        CONFIG['frigate_export'].setdefault('rtsp_host', CONFIG['rtsp_server']['address'])
+        CONFIG['frigate_export'].setdefault('rtsp_port', CONFIG['rtsp_server']['port'])
+        CONFIG['frigate_export'].setdefault('roles', ['detect', 'record'])
+        CONFIG['frigate_export'].setdefault('detect_defaults', {})
+        CONFIG['frigate_export']['detect_defaults'].setdefault('width', 1280)
+        CONFIG['frigate_export']['detect_defaults'].setdefault('height', 720)
+        CONFIG['frigate_export']['detect_defaults'].setdefault('fps', 1)
+
+        # Optional BlinkBridge utility web server
+        CONFIG.setdefault('web', {})
+        CONFIG['web'].setdefault('enabled', False)
+        CONFIG['web'].setdefault('host', '0.0.0.0')
+        CONFIG['web'].setdefault('port', 8765)
         
     except KeyError as e:
         print(f"ERROR: Configuration validation failed: {e}", file=sys.stderr)

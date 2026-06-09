@@ -73,6 +73,23 @@ Edit `config.json` with the following settings:
 - `rtsp_server.address` - MediaMTX server address (default: `mediamtx`)
 - `rtsp_server.port` - RTSP port (default: `8554`)
 
+**Frigate Camera Snippet Export (optional):**
+- `frigate_export.enabled` - Enable exporting Frigate `cameras:` YAML block
+- `frigate_export.output_path` - File path where snippet is written
+- `frigate_export.rtsp_host` / `frigate_export.rtsp_port` - Host/port used in exported RTSP URLs
+- `frigate_export.roles` - Roles included for each camera input (e.g. `detect`, `record`)
+- `frigate_export.detect_defaults` - Default detect width/height/fps for exported cameras
+
+When enabled, BlinkBridge writes a standalone `cameras:` block file after startup completes and cameras are discovered. The file is intended for manual copy/merge into a user-managed Frigate config.
+
+**Web Access (optional):**
+- `web.enabled` - Enable BlinkBridge utility web page
+- `web.host` / `web.port` - Bind address and port for the web UI
+- UI endpoint: `http://<host>:8765/`
+- Raw YAML endpoint: `http://<host>:8765/frigate-cameras.yml`
+
+In Codespaces, forward port `8765` to access the page from your browser.
+
 ### RTSP Stream URLs
 
 Streams are available at: `rtsp://<host>:8554/<camera_name>`
