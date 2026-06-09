@@ -2,7 +2,7 @@
 FROM python:alpine
 
 # Install system dependencies
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg git
 
 # Add Intel hardware acceleration support for ffmpeg (optional)
 # RUN apk add --no-cache \

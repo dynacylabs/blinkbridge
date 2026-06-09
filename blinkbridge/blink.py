@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 from aiohttp import ClientSession
+from blinkpy import api as blink_api
 from blinkpy.auth import Auth, BlinkTwoFARequiredError, TokenRefreshFailed, LoginError
 from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
@@ -20,6 +21,46 @@ from blinkbridge.config import *
 
 
 log = logging.getLogger(__name__)
+
+
+def _apply_blinkpy_oauth_compat_patch() -> None:
+    """Patch BlinkPy OAuth signin to handle TSV challenge responses.
+
+    Blink's OAuth endpoint may return HTTP 202 with TSV metadata instead of
+    HTTP 412 for secondary verification. BlinkPy 0.25.5 treats only 412 as
+    2FA-required, which causes login to fail even when verification can
+    continue. This compatibility patch maps 202 to the same 2FA flow.
+    """
+    if getattr(blink_api, "_blinkbridge_oauth_signin_patched", False):
+        return
+
+    async def oauth_signin_compat(auth, email, password, csrf_token):
+        headers = {
+            "User-Agent": blink_api.OAUTH_USER_AGENT,
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://api.oauth.blink.com",
+            "Referer": blink_api.OAUTH_SIGNIN_URL,
+        }
+        data = {
+            "username": email,
+            "password": password,
+            "csrf-token": csrf_token,
+        }
+
+        response = await auth.session.post(
+            blink_api.OAUTH_SIGNIN_URL, headers=headers, data=data, allow_redirects=False
+        )
+
+        if response.status in (412, 202):
+            return "2FA_REQUIRED"
+        if response.status in (301, 302, 303, 307, 308):
+            return "SUCCESS"
+
+        return None
+
+    blink_api.oauth_signin = oauth_signin_compat
+    blink_api._blinkbridge_oauth_signin_patched = True
 
 
 def find_most_recent_clip_url(recent_clips: dict, date: str) -> str:
@@ -90,6 +131,9 @@ class CameraManager:
         self.blink = Blink(session=self.session)
         path_cred = PATH_CONFIG / ".cred.json"
 
+        # Apply compatibility patch for Blink OAuth signin status handling.
+        _apply_blinkpy_oauth_compat_patch()
+
         try:
             if path_cred.exists():
                 log.debug("Loading saved Blink credentials")
@@ -108,7 +152,12 @@ class CameraManager:
             raise
 
         try:
-            await self.blink.start()
+            started = await self.blink.start()
+            if not started or not getattr(self.blink, 'available', False):
+                raise LoginError(
+                    "Blink platform setup failed after authentication. "
+                    "Check credentials/2FA and rerun initialization."
+                )
             log.info("Successfully authenticated with Blink")
         except BlinkTwoFARequiredError:
             log.info("Two-factor authentication required")

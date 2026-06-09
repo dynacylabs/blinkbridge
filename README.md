@@ -42,6 +42,12 @@ Blink cameras are battery operated and don't have native RTSP support. This tool
    ```
    RTSP URLs will be printed to the console.
 
+### Runtime Note
+
+The current supported runtime is the Python service started by Docker Compose.
+
+The shell scripts in the `scripts/` folder are legacy helpers from earlier development and are not part of the default runtime path used by the container entrypoint.
+
 ### Configuration
 
 Edit `config.json` with the following settings:

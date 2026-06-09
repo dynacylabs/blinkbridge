@@ -254,7 +254,10 @@ class StreamServer:
             
             self.current_still_video = next_still_video
         except Exception as e:
-            log.error(f"{self.stream_name}: Failed to create still video from {video_file}: {e}", exc_info=True)
+            log.error(
+                f"{self.stream_name}: Failed to create still video from {file_name_input_video}: {e}",
+                exc_info=True,
+            )
             try:
                 if next_still_video.exists():
                     next_still_video.unlink()  # Clean up failed still video
