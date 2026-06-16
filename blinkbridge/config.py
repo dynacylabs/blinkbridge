@@ -126,8 +126,11 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         # Validate other required settings
         if 'blink' not in CONFIG:
             raise KeyError("Missing 'blink' section in configuration")
-        if 'login' not in CONFIG['blink']:
-            raise KeyError("Missing 'blink.login' section in configuration")
+        # login credentials are optional — they can be supplied at runtime via
+        # the web UI instead of being stored in the config file.
+        CONFIG['blink'].setdefault('login', {})
+        CONFIG['blink']['login'].setdefault('username', '')
+        CONFIG['blink']['login'].setdefault('password', '')
         
         # Set defaults for optional settings
         CONFIG.setdefault('log_level', 'INFO')

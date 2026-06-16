@@ -41,6 +41,7 @@ class StreamServer:
         self.stream_name_sanitized: str = stream_name.replace(' ', '_').lower()
         self.current_still_video: Optional[Path] = None
         self.process: Optional[subprocess.Popen] = None
+        self.failure_detected: bool = False  # True after first failure spotted, until restart attempted
 
     def _run_server(self) -> str:
         """Start the FFmpeg RTSP streaming process.

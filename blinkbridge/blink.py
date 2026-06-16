@@ -115,6 +115,7 @@ class CameraManager:
         self.cameras_without_clips: set = set()
         self.cameras_ever_had_real_clip: set = set()
         self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
+        self.credentials_provider: Optional[Callable[[], Awaitable[dict]]] = None
 
     async def _login(self) -> None:
         """Login to Blink using OAuth v2 authentication.
@@ -136,6 +137,22 @@ class CameraManager:
         # Apply compatibility patch for Blink OAuth signin status handling.
         _apply_blinkpy_oauth_compat_patch()
 
+        # If no credentials are present in config, ask for them via the provider
+        # (web UI) before attempting any login — but only when there is no saved
+        # credential cache, since the cache is self-contained and doesn't need a
+        # username/password to refresh.
+        login_cfg = CONFIG['blink']['login']
+        if not login_cfg.get('username') and not path_cred.exists():
+            if self.credentials_provider is not None:
+                log.info("No Blink credentials in config — requesting via web UI")
+                creds = await self.credentials_provider()
+                login_cfg = creds
+            else:
+                raise LoginError(
+                    "No Blink credentials configured and no credentials provider available. "
+                    "Set blink.login in config.json or enable the web server."
+                )
+
         # Attempt login with saved credentials first; on failure delete the
         # cache file and retry once with fresh credentials from config so that
         # the 2FA flow can proceed within the same process invocation.
@@ -149,10 +166,10 @@ class CameraManager:
                     self.blink.auth = Auth(saved_data, no_prompt=True, session=self.session)
                 except (json.JSONDecodeError, IOError) as e:
                     log.debug(f"Failed to load saved credentials: {e}, falling back to config")
-                    self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
+                    self.blink.auth = Auth(login_cfg, no_prompt=True, session=self.session)
             else:
                 log.debug("Using Blink credentials from config")
-                self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
+                self.blink.auth = Auth(login_cfg, no_prompt=True, session=self.session)
 
             try:
                 started = await self.blink.start()
@@ -177,12 +194,22 @@ class CameraManager:
             except (TokenRefreshFailed, LoginError) as e:
                 if use_saved:
                     # Stale / invalid saved credentials — discard and retry fresh.
-                    log.warning(f"Saved credentials rejected ({e}), retrying with config credentials")
+                    log.warning(f"Saved credentials rejected ({e}), retrying with fresh credentials")
                     try:
                         path_cred.unlink()
                     except OSError as unlink_err:
                         log.warning(f"Failed to remove stale credentials file: {unlink_err}")
                     use_saved = False
+                    # If config has no username we need to ask for credentials now.
+                    if not login_cfg.get('username'):
+                        if self.credentials_provider is not None:
+                            log.info("Stale cache removed, no credentials in config — requesting via web UI")
+                            login_cfg = await self.credentials_provider()
+                        else:
+                            raise LoginError(
+                                "Saved credentials are invalid and no fallback credentials are available. "
+                                "Set blink.login in config.json or enable the web server."
+                            )
                     continue  # retry the loop
                 log.error(f"Authentication failed: {e}")
                 raise

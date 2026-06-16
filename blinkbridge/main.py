@@ -47,6 +47,7 @@ class Application:
         self.cam_manager: Optional[CameraManager] = None
         self.running: bool = False
         self.web_server: Optional[BlinkBridgeWebServer] = None
+        self._monitor_task: Optional[asyncio.Task] = None
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> Optional[StreamServer]:
         """Start a stream server for a camera.
@@ -179,6 +180,7 @@ class Application:
             self.cam_manager = CameraManager()
             if self.web_server is not None:
                 self.cam_manager.twofa_provider = self.web_server.request_2fa_code
+                self.cam_manager.credentials_provider = self.web_server.request_credentials
             await self.cam_manager.start()
         except Exception as e:
             log.error(f"Failed to initialize camera manager: {e}")
@@ -204,7 +206,10 @@ class Application:
 
         if self.running:
             try:
-                await self._monitor_cameras()
+                self._monitor_task = asyncio.create_task(self._monitor_cameras())
+                await self._monitor_task
+            except asyncio.CancelledError:
+                log.debug("Monitor task cancelled")
             except Exception as e:
                 log.error(f"Error in camera monitoring loop: {e}")
                 raise
@@ -316,6 +321,7 @@ class Application:
             port=int(web_cfg.get('port', 8765)),
             frigate_export_path=export_path,
         )
+        self.web_server.restart_callback = self.restart
         await self.web_server.start()
         log.info(f"Web server enabled at http://{web_cfg.get('host', '0.0.0.0')}:{web_cfg.get('port', 8765)}")
     
@@ -405,8 +411,14 @@ class Application:
             try:
                 ss = self.stream_servers[camera_name]
                 if ss.is_running():
+                    ss.failure_detected = False
                     continue
-                
+
+                # Log once when the failure is first detected.
+                if not ss.failure_detected:
+                    ss.failure_detected = True
+                    log.warning(f"{camera_name}: stream stopped (failure count: {ss.failure_count + 1})")
+
                 if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
                     log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
                     try:
@@ -415,11 +427,12 @@ class Application:
                         log.debug(f"{camera_name}: already removed from stream servers")
                     continue
 
-                log.warning(f"{camera_name}: server failed {ss.failure_count + 1} time(s)")
-
                 if datetime.now() < ss.datetime_started + DELAY_RESTART:
                     log.debug(f"{camera_name}: waiting for restart delay to elapse")
                     continue
+
+                log.warning(f"{camera_name}: attempting restart (failure {ss.failure_count + 1})")
+                ss.failure_detected = False  # reset so the next failure logs again
 
                 ss_new = await self.start_stream(camera_name, redownload=True)
                 if ss_new is None:
@@ -457,6 +470,17 @@ class Application:
                 await self.web_server.stop()
             except Exception as e:
                 log.warning(f"Error stopping web server: {e}")
+
+        # Remove the Frigate camera snippet so a stale file is never served
+        # after the bridge goes offline.
+        try:
+            export_cfg = CONFIG.get('frigate_export', {})
+            export_path = Path(str(export_cfg.get('output_path', PATH_CONFIG / 'frigate_cameras.yml')))
+            if export_path.exists():
+                export_path.unlink()
+                log.debug(f"Removed Frigate export file: {export_path}")
+        except Exception as e:
+            log.warning(f"Failed to remove Frigate export file on shutdown: {e}")
         
         if self.cam_manager:
             try:
@@ -465,6 +489,76 @@ class Application:
                 log.warning(f"Error closing camera manager: {e}")
         
         log.info("Application closed")
+
+    async def restart(self) -> None:
+        """Restart camera streams and Blink connection without stopping the web server.
+
+        Tears down all running streams and the camera manager, then re-initialises
+        them from scratch. The web server keeps running throughout so the /restart
+        endpoint remains reachable.
+        """
+        log.info("Restarting BlinkBridge (streams + Blink connection)...")
+
+        # Cancel the running monitor loop
+        self.running = False
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
+        # Stop all streams
+        for camera_name, ss in list(self.stream_servers.items()):
+            try:
+                ss.close()
+            except Exception as e:
+                log.warning(f"{camera_name}: error stopping stream during restart: {e}")
+        self.stream_servers.clear()
+
+        # Remove stale Frigate export
+        try:
+            export_cfg = CONFIG.get('frigate_export', {})
+            export_path = Path(str(export_cfg.get('output_path', PATH_CONFIG / 'frigate_cameras.yml')))
+            if export_path.exists():
+                export_path.unlink()
+        except Exception as e:
+            log.warning(f"Failed to remove Frigate export file during restart: {e}")
+
+        # Close the old camera manager
+        if self.cam_manager:
+            try:
+                await self.cam_manager.close()
+            except Exception as e:
+                log.warning(f"Error closing camera manager during restart: {e}")
+            self.cam_manager = None
+
+        # Re-initialise
+        self.running = True
+        try:
+            self.cam_manager = CameraManager()
+            if self.web_server is not None:
+                self.cam_manager.twofa_provider = self.web_server.request_2fa_code
+                self.cam_manager.credentials_provider = self.web_server.request_credentials
+            await self.cam_manager.start()
+        except Exception as e:
+            log.error(f"Restart: failed to initialise camera manager: {e}")
+            return
+
+        try:
+            enabled_cameras = self._get_enabled_cameras()
+            await self._initialize_camera_streams(enabled_cameras)
+        except Exception as e:
+            log.error(f"Restart: error initialising camera streams: {e}")
+
+        try:
+            self._export_frigate_camera_block()
+        except Exception as e:
+            log.warning(f"Restart: failed to export Frigate camera block: {e}")
+
+        log.info("Restart complete — resuming camera monitoring")
+        # Start a fresh monitoring task.
+        self._monitor_task = asyncio.create_task(self._monitor_cameras())
 
 async def main() -> None:
     """Main entry point for the application.
