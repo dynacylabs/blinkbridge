@@ -166,9 +166,19 @@ class Application:
             TokenRefreshFailed: If Blink token refresh fails
             Exception: For other critical initialization errors
         """
+        self.running = True
+
+        # Start the web server before camera login so the /2fa endpoint is
+        # reachable if Blink requires two-factor authentication.
         try:
-            self.running = True
+            await self._start_web_server()
+        except Exception as e:
+            log.warning(f"Failed to start web server: {e}")
+
+        try:
             self.cam_manager = CameraManager()
+            if self.web_server is not None:
+                self.cam_manager.twofa_provider = self.web_server.request_2fa_code
             await self.cam_manager.start()
         except Exception as e:
             log.error(f"Failed to initialize camera manager: {e}")
@@ -192,11 +202,6 @@ class Application:
         except Exception as e:
             log.warning(f"Failed to export Frigate camera block: {e}")
 
-        try:
-            self._start_web_server()
-        except Exception as e:
-            log.warning(f"Failed to start web server: {e}")
-        
         if self.running:
             try:
                 await self._monitor_cameras()
@@ -297,8 +302,8 @@ class Application:
         output_path.write_text("\n".join(lines) + "\n")
         log.info(f"Exported Frigate camera block for {len(camera_names)} cameras to {output_path}")
 
-    def _start_web_server(self) -> None:
-        """Start optional utility web server."""
+    async def _start_web_server(self) -> None:
+        """Create and start the optional utility web server."""
         web_cfg = CONFIG.get('web', {})
         if not web_cfg.get('enabled', False):
             return
@@ -311,7 +316,7 @@ class Application:
             port=int(web_cfg.get('port', 8765)),
             frigate_export_path=export_path,
         )
-        asyncio.create_task(self.web_server.start())
+        await self.web_server.start()
         log.info(f"Web server enabled at http://{web_cfg.get('host', '0.0.0.0')}:{web_cfg.get('port', 8765)}")
     
     async def _monitor_cameras(self) -> None:

@@ -9,7 +9,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Awaitable, Callable, Dict, Optional, Tuple, Union
 
 from aiohttp import ClientSession
 from blinkpy import api as blink_api
@@ -114,76 +114,81 @@ class CameraManager:
         self.black_video_path: Optional[Path] = None
         self.cameras_without_clips: set = set()
         self.cameras_ever_had_real_clip: set = set()
+        self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
 
     async def _login(self) -> None:
         """Login to Blink using OAuth v2 authentication.
-        
-        Attempts to use saved credentials if available, otherwise performs
-        fresh authentication. Handles 2FA if required.
-        
+
+        Tries saved credentials first. If they are stale or invalid the cache
+        file is removed and a fresh login is attempted. The fresh login may
+        require 2FA; if so, the code is collected via ``twofa_provider`` (web
+        UI) when available, otherwise the terminal ``input()`` is used.
+
         Raises:
             LoginError: If authentication fails
             TokenRefreshFailed: If token refresh fails
-            
+
         Note:
             Credentials are saved to .cred.json in the config directory for reuse.
         """
-        self.blink = Blink(session=self.session)
         path_cred = PATH_CONFIG / ".cred.json"
 
         # Apply compatibility patch for Blink OAuth signin status handling.
         _apply_blinkpy_oauth_compat_patch()
 
-        try:
-            if path_cred.exists():
+        # Attempt login with saved credentials first; on failure delete the
+        # cache file and retry once with fresh credentials from config so that
+        # the 2FA flow can proceed within the same process invocation.
+        use_saved = path_cred.exists()
+        for attempt in range(2):
+            self.blink = Blink(session=self.session)
+            if use_saved:
                 log.debug("Loading saved Blink credentials")
                 try:
                     saved_data = await json_load(path_cred)
                     self.blink.auth = Auth(saved_data, no_prompt=True, session=self.session)
                 except (json.JSONDecodeError, IOError) as e:
-                    log.debug(f"Failed to load saved credentials: {e}")
-                    log.debug("Falling back to credentials from config")
+                    log.debug(f"Failed to load saved credentials: {e}, falling back to config")
                     self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
             else:
                 log.debug("Using Blink credentials from config")
                 self.blink.auth = Auth(CONFIG['blink']['login'], no_prompt=True, session=self.session)
-        except Exception as e:
-            log.error(f"Failed to initialize authentication: {e}")
-            raise
 
-        try:
-            started = await self.blink.start()
-            if not started or not getattr(self.blink, 'available', False):
-                raise LoginError(
-                    "Blink platform setup failed after authentication. "
-                    "Check credentials/2FA and rerun initialization."
-                )
-            log.info("Successfully authenticated with Blink")
-        except BlinkTwoFARequiredError:
-            log.info("Two-factor authentication required")
             try:
-                twofa_code = input("Enter your 2FA code: ")
-                
+                started = await self.blink.start()
+                if not started or not getattr(self.blink, 'available', False):
+                    raise LoginError(
+                        "Blink platform setup failed after authentication. "
+                        "Check credentials/2FA and rerun initialization."
+                    )
+                log.info("Successfully authenticated with Blink")
+                break  # success — exit retry loop
+            except BlinkTwoFARequiredError:
+                log.info("Two-factor authentication required")
+                if self.twofa_provider is not None:
+                    twofa_code = await self.twofa_provider()
+                else:
+                    twofa_code = input("Enter your 2FA code: ")
                 success = await self.blink.send_2fa_code(twofa_code)
                 if not success:
                     raise LoginError("2FA verification failed")
-                
                 log.info("Successfully authenticated with Blink (2FA completed)")
-            except Exception as e:
-                log.error(f"2FA authentication failed: {e}")
+                break  # success after 2FA — exit retry loop
+            except (TokenRefreshFailed, LoginError) as e:
+                if use_saved:
+                    # Stale / invalid saved credentials — discard and retry fresh.
+                    log.warning(f"Saved credentials rejected ({e}), retrying with config credentials")
+                    try:
+                        path_cred.unlink()
+                    except OSError as unlink_err:
+                        log.warning(f"Failed to remove stale credentials file: {unlink_err}")
+                    use_saved = False
+                    continue  # retry the loop
+                log.error(f"Authentication failed: {e}")
                 raise
-        except (TokenRefreshFailed, LoginError) as e:
-            log.error(f"Authentication failed: {e}")
-            if path_cred.exists():
-                try:
-                    log.debug("Removing invalid saved credentials")
-                    path_cred.unlink()
-                except OSError as unlink_err:
-                    log.warning(f"Failed to remove invalid credentials file: {unlink_err}")
-            raise
-        except Exception as e:
-            log.error(f"Unexpected error during authentication: {e}")
-            raise
+            except Exception as e:
+                log.error(f"Unexpected error during authentication: {e}")
+                raise
 
         try:
             log.debug("Saving Blink credentials")
