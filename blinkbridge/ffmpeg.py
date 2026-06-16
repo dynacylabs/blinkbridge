@@ -364,30 +364,35 @@ class StillVideoCreator:
             until completion or check for errors.
         """
         self.exception: Optional[Exception] = None
+        # Derive a per-camera temp frame path from the still video path so
+        # concurrent cameras don't race on a shared last_frame.jpg.
+        file_name_still_video = Path(file_name_still_video)
+        temp_frame = file_name_still_video.with_suffix('.frame.jpg')
         self.thread = threading.Thread(
             target=self._run, 
-            args=(file_name_input_video, output_duration, file_name_still_video)
+            args=(file_name_input_video, output_duration, file_name_still_video, temp_frame)
         )
         self.thread.start()
 
     def _run(self, 
              file_name_input_video: Union[str, Path], 
              output_duration: float, 
-             file_name_still_video: Union[str, Path]) -> None:
+             file_name_still_video: Union[str, Path],
+             still_image_file_name: Union[str, Path]) -> None:
         """Background thread worker that creates the still video.
         
         Args:
             file_name_input_video: Path to source video
             output_duration: Duration in seconds
             file_name_still_video: Output path
+            still_image_file_name: Per-camera temp frame path (avoids shared-file races)
             
         Note:
             Any exceptions are stored in self.exception for retrieval by wait().
         """
-        still_image_file_name = None
+        still_image_file_name = Path(still_image_file_name)
         try:
             log.debug(f"Creating still video from {file_name_input_video}")
-            still_image_file_name = PATH_VIDEOS / 'last_frame.jpg'
             # Extract last frame from source video
             lfg = VideoToLastFrame(file_name_input_video, still_image_file_name)
             # Get stream parameters from source

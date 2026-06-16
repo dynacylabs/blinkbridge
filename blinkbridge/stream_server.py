@@ -244,9 +244,8 @@ class StreamServer:
                 
             self._enqueue_clip(next_still_video)
 
-            if self.current_still_video and not still_only:
+            if self.current_still_video:
                 try:
-                    pass  # Delete old still video silently
                     self.current_still_video.unlink()
                 except OSError as e:
                     log.warning(f"{self.stream_name}: failed to delete old still video: {e}")
@@ -266,6 +265,19 @@ class StreamServer:
                 log.warning(f"{self.stream_name}: failed to cleanup still video: {cleanup_err}")
             raise
     
+    def _sweep_orphaned_files(self) -> None:
+        """Delete any still video and temp frame files left by a previous run."""
+        for pattern in (
+            f"{self.stream_name_sanitized}_still_*.mp4",
+            f"{self.stream_name_sanitized}_still_*.frame.jpg",
+        ):
+            for path in PATH_VIDEOS.glob(pattern):
+                try:
+                    path.unlink()
+                    log.debug(f"{self.stream_name}: removed orphaned file {path.name}")
+                except OSError as e:
+                    log.warning(f"{self.stream_name}: could not remove orphaned file {path.name}: {e}")
+
     def is_running(self) -> bool:
         """Check if the streaming process is still running.
         
@@ -333,7 +345,10 @@ class StreamServer:
         except Exception as e:
             log.error(f"{self.stream_name}: failed to create concat files: {e}")
             raise
-            
+
+        # Remove any orphaned still/frame files left by a previous crashed run.
+        self._sweep_orphaned_files()
+
         try:
             self.add_video(file_name_initial_video, still_only=True)
         except Exception as e:
