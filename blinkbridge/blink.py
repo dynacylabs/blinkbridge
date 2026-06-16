@@ -154,10 +154,10 @@ class CameraManager:
                 )
 
         # Attempt login with saved credentials first; on failure delete the
-        # cache file and retry once with fresh credentials from config so that
-        # the 2FA flow can proceed within the same process invocation.
+        # cache file and retry once with fresh credentials. If credentials come
+        # from the web UI, re-prompt on failure rather than crashing.
         use_saved = path_cred.exists()
-        for attempt in range(2):
+        for attempt in range(10):  # generous upper bound; breaks on success or hard error
             self.blink = Blink(session=self.session)
             if use_saved:
                 log.debug("Loading saved Blink credentials")
@@ -211,6 +211,13 @@ class CameraManager:
                                 "Set blink.login in config.json or enable the web server."
                             )
                     continue  # retry the loop
+                # Fresh credentials (from config or web UI) were also rejected.
+                if not login_cfg.get('username') or self.credentials_provider is not None:
+                    # Credentials came from the web UI — re-prompt rather than crash.
+                    log.warning(f"Credentials rejected ({e}), re-prompting via web UI")
+                    if self.credentials_provider is not None:
+                        login_cfg = await self.credentials_provider()
+                        continue
                 log.error(f"Authentication failed: {e}")
                 raise
             except Exception as e:
