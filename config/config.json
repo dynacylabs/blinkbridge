@@ -20,13 +20,13 @@
       "poll_interval": 1
     },
     "rtsp_server": {
-      "address": "mediamtx",
+      "address": "frigate-mediamtx",
       "port": 8554
     },
     "frigate_export": {
       "enabled": true,
       "output_path": "/config/frigate_cameras.yml",
-      "rtsp_host": "mediamtx",
+      "rtsp_host": "frigate-mediamtx",
       "rtsp_port": 8554,
       "roles": ["detect", "record"],
       "detect_defaults": {
@@ -42,4 +42,3 @@
     },
     "log_level": "INFO"
 }
-  
