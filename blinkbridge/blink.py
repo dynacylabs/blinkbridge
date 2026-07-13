@@ -103,8 +103,6 @@ class CameraManager:
         camera_last_record: Dict tracking last recorded event per camera
         metadata: List of video metadata from Blink API
         black_video_path: Path to black placeholder video
-        cameras_without_clips: Set of cameras currently without clips
-        cameras_ever_had_real_clip: Set of cameras that have had clips (persistent)
     """
     
     def __init__(self) -> None:
@@ -112,8 +110,6 @@ class CameraManager:
         self.camera_last_record: Dict[str, Optional[str]] = defaultdict(lambda: None)
         self.metadata: Optional[list] = None
         self.black_video_path: Optional[Path] = None
-        self.cameras_without_clips: set = set()
-        self.cameras_ever_had_real_clip: set = set()
         self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
         self.credentials_provider: Optional[Callable[[], Awaitable[dict]]] = None
 
@@ -329,21 +325,17 @@ class CameraManager:
                 self.metadata = []
             raise
 
-    async def save_latest_clip(self, camera_name: str, force: bool=False, use_black_fallback: bool=True) -> Optional[Path]:
+    async def save_latest_clip(self, camera_name: str, force: bool=False) -> Optional[Path]:
         """Download and save latest clip for camera.
         
         Args:
             camera_name: Name of the camera
             force: Force re-download even if clip exists (default: False)
-            use_black_fallback: Use black video if no clips available, only for 
-                cameras that never had clips (default: True)
         
         Returns:
-            Path to the video file, or None if unavailable and no fallback
-            
-        Note:
-            Once a camera has had a real clip, it will never fall back to the
-            black placeholder video, even if new clips temporarily unavailable.
+            Path to the video file. Falls back to black placeholder if no clip is
+            available. Returns None only if both the clip download and the
+            placeholder are unavailable.
         """
         try:
             camera_name_sanitized = camera_name.lower().replace(' ', '_')
@@ -355,9 +347,6 @@ class CameraManager:
         try:
             if file_name.exists() and not force:
                 log.debug(f"{camera_name}: skipping download, {file_name} exists")
-                if file_name != self.black_video_path:
-                    self.cameras_without_clips.discard(camera_name)
-                    self.cameras_ever_had_real_clip.add(camera_name)
                 return file_name
         except OSError as e:
             log.warning(f"{camera_name}: error checking if file exists: {e}")
@@ -371,12 +360,9 @@ class CameraManager:
 
         if media is None:
             log.warning(f"{camera_name}: no clips found for camera")
-            if use_black_fallback and self.black_video_path and camera_name not in self.cameras_ever_had_real_clip:
-                log.info(f"{camera_name}: using black video placeholder (never had real clip)")
-                self.cameras_without_clips.add(camera_name)
+            if self.black_video_path:
+                log.info(f"{camera_name}: using black video placeholder (no clips yet)")
                 return self.black_video_path
-            elif camera_name in self.cameras_ever_had_real_clip:
-                log.warning(f"{camera_name}: no new clips found, but camera has had real clips before")
             return None
 
         try:
@@ -402,8 +388,6 @@ class CameraManager:
                 log.error(f"{camera_name}: video file not created or is empty")
                 raise IOError("Failed to write video file")
             
-            self.cameras_without_clips.discard(camera_name)
-            self.cameras_ever_had_real_clip.add(camera_name)
             log.debug(f"{camera_name}: successfully downloaded real clip ({file_name.stat().st_size} bytes)")
             return file_name
         except IOError as e:
@@ -411,28 +395,19 @@ class CameraManager:
         except Exception as e:
             log.error(f"{camera_name}: failed to download clip: {e}")
         
-        # If download fails but camera had clips before, try to use cached file
+        # Download failed — try cached file, then black placeholder
         try:
-            if camera_name in self.cameras_ever_had_real_clip and file_name.exists():
+            if file_name.exists():
                 log.warning(f"{camera_name}: using cached clip after download failure")
                 return file_name
         except OSError:
             pass
-            
+
+        if self.black_video_path:
+            log.warning(f"{camera_name}: download failed, falling back to black placeholder")
+            return self.black_video_path
+
         return None
-    
-    def _mark_camera_has_clip(self, camera_name: str) -> None:
-        """Mark that a camera has a real clip.
-        
-        Args:
-            camera_name: Name of the camera
-            
-        Note:
-            This is a permanent state change - once marked, the camera will
-            never fall back to black placeholder video.
-        """
-        self.cameras_without_clips.discard(camera_name)
-        self.cameras_ever_had_real_clip.add(camera_name)
     
     async def _save_clip(self, camera_name: str, url: str, file_name: Path) -> None:
         """Save a video clip from URL to file.
@@ -534,7 +509,6 @@ class CameraManager:
                     log.debug(f"{camera_name}: found recent clip in snapshot, saving to {file_name}")
                     try:
                         await self._save_clip(camera_name, url, file_name)
-                        self._mark_camera_has_clip(camera_name)
                         self.camera_last_record[camera_name] = last_record
                         log.debug(f"{camera_name}: clip saved to {file_name}")
                         return file_name
@@ -560,7 +534,6 @@ class CameraManager:
                 log.error(f"{camera_name}: video file not created or is empty")
                 return None
                 
-            self._mark_camera_has_clip(camera_name)
             self.camera_last_record[camera_name] = last_record
             log.debug(f"{camera_name}: clip saved to {file_name} ({file_name.stat().st_size} bytes)")
             return file_name

@@ -80,9 +80,7 @@ class Application:
             log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
             return None
 
-        is_placeholder = camera_name in self.cam_manager.cameras_without_clips
-        status = "black placeholder (waiting for first clip)" if is_placeholder else "real clip"
-        log.info(f"{camera_name}: starting stream with {status}")
+        log.info(f"{camera_name}: starting stream")
         
         try:
             stream_server = StreamServer(camera_name)
@@ -124,41 +122,6 @@ class Application:
             log.error(f"{camera_name}: error in check_for_motion: {e}", exc_info=True)
             return False
     
-    async def check_for_first_clip(self, camera_name: str) -> bool:
-        """Check if a camera without clips now has its first clip available.
-        
-        Args:
-            camera_name: Name of the camera to check
-            
-        Returns:
-            True if first clip is now available and was added, False otherwise
-            
-        Note:
-            Only checks cameras that are in cameras_without_clips set.
-            Once a clip is found, upgrades the stream from black placeholder.
-        """
-        try:
-            if camera_name not in self.cam_manager.cameras_without_clips:
-                return False
-            
-            ss = self.stream_servers.get(camera_name)
-            if not ss or not ss.is_running():
-                log.debug(f"{camera_name}: stream not running when checking for first clip")
-                return False
-            
-            await self.cam_manager.refresh_metadata()
-            file_name = await self.cam_manager.save_latest_clip(camera_name, force=True, use_black_fallback=False)
-            
-            if file_name:
-                log.info(f"{camera_name}: first clip now available, upgrading from black placeholder")
-                ss.add_video(file_name)
-                return True
-            
-            return False
-        except Exception as e:
-            log.error(f"{camera_name}: error checking for first clip: {e}", exc_info=True)
-            return False
-        
     async def start(self) -> None:
         """Start the application, initialize cameras, and begin monitoring.
         
@@ -365,29 +328,21 @@ class Application:
         Args:
             poll_count: Current poll iteration number
         """
-        active_cams = len(self.stream_servers) - len(self.cam_manager.cameras_without_clips)
-        waiting_cams = len(self.cam_manager.cameras_without_clips)
         log.debug(
-            f"Poll #{poll_count}: {active_cams} cameras active, "
-            f"{waiting_cams} waiting for first clip"
+            f"Poll #{poll_count}: {len(self.stream_servers)} cameras active"
         )
     
     async def _check_cameras_for_updates(self) -> None:
-        """Check all cameras for motion or first clip availability.
+        """Check all cameras for motion events.
         
-        For cameras without clips, checks if first clip is now available.
-        For cameras with clips, checks for new motion events.
+        Checks every active stream for new motion clips and adds them to the stream.
         Closes streams that encounter errors.
         """
         for camera_name in list(self.stream_servers.keys()):
             if not self.running:
                 break
             try:
-                if camera_name in self.cam_manager.cameras_without_clips:
-                    log.debug(f"{camera_name}: checking for first clip...")
-                    await self.check_for_first_clip(camera_name)
-                else:
-                    await self.check_for_motion(camera_name)
+                await self.check_for_motion(camera_name)
             except Exception as e:
                 log.error(f"{camera_name}: critical error checking for updates: {e}", exc_info=True)
                 try:
