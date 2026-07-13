@@ -40,3 +40,6 @@ tmp/
 
 # Pycache
 __pycache__
+
+# Config
+config/config.json
