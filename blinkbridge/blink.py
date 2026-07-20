@@ -18,6 +18,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
+from blinkbridge.ffmpeg import generate_placeholder_video
 
 
 log = logging.getLogger(__name__)
@@ -110,6 +111,9 @@ class CameraManager:
         self.camera_last_record: Dict[str, Optional[str]] = defaultdict(lambda: None)
         self.metadata: Optional[list] = None
         self.black_video_path: Optional[Path] = None
+        self.starting_placeholder_path: Optional[Path] = None
+        self.offline_placeholder_path: Optional[Path] = None
+        self.error_placeholder_path: Optional[Path] = None
         self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
         self.credentials_provider: Optional[Callable[[], Awaitable[dict]]] = None
 
@@ -292,6 +296,79 @@ class CameraManager:
         log.debug(f"Black placeholder video created at {black_video_path}")
         return black_video_path
     
+    def is_camera_offline(self, camera_name: str) -> bool:
+        """Return True if the camera or its sync module is offline.
+
+        Checks both the camera's own online status and its parent sync module's
+        status. A camera cannot be considered online if its sync module is offline,
+        even if the camera object itself reports online (blinkpy may not propagate
+        sync-module outages to individual camera objects in all cases).
+
+        Returns False (optimistic) if the camera is not found or state is unknown,
+        so an ambiguous refresh failure does not incorrectly trigger OFFLINE.
+        """
+        try:
+            camera = self.blink.cameras[camera_name]
+        except (KeyError, AttributeError):
+            return False
+
+        try:
+            camera_online = camera.online
+        except Exception:
+            camera_online = True  # optimistic
+
+        if not camera_online:
+            return True
+
+        try:
+            sync = getattr(camera, 'sync', None)
+            if sync is not None:
+                sync_online = sync.online
+                if not sync_online:
+                    return True
+        except Exception:
+            pass  # optimistic: don't mark offline if we can't read sync state
+
+        return False
+
+    def _generate_placeholders(self) -> None:
+        """Generate the three placeholder videos used for camera state display.
+
+        Creates:
+        - starting_placeholder.mp4 : grey screen with white "Starting..." text
+        - offline_placeholder.mp4  : black screen with red "OFFLINE" text
+        - error_placeholder.mp4    : black screen with red "ERROR" text
+
+        All videos are 1920x1080 H264 at 15 fps to be codec-compatible with
+        real Blink clips in the concat stream.
+        """
+        duration = CONFIG['still_video_duration']
+        specs = [
+            ('starting_placeholder.mp4', 'Starting...', 'gray',  'white', 'starting_placeholder_path'),
+            ('offline_placeholder.mp4',  'OFFLINE',     'black',  'red',  'offline_placeholder_path'),
+            ('error_placeholder.mp4',    'ERROR',       'black',  'red',  'error_placeholder_path'),
+        ]
+        for filename, text, bg, fg, attr in specs:
+            path = PATH_VIDEOS / filename
+            if path.exists():
+                log.debug(f"Placeholder already exists: {path}")
+                setattr(self, attr, path)
+                continue
+            ok = generate_placeholder_video(
+                output_path=path,
+                text=text,
+                bg_color=bg,
+                text_color=fg,
+                width=1920,
+                height=1080,
+                fps=15,
+                duration=duration,
+            )
+            if ok:
+                setattr(self, attr, path)
+            else:
+                log.error(f"Failed to generate placeholder video: {filename}")
+
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
         """Detect resolution from clips. Returns default Blink resolution (1920x1080).
         
@@ -360,9 +437,6 @@ class CameraManager:
 
         if media is None:
             log.warning(f"{camera_name}: no clips found for camera")
-            if self.black_video_path:
-                log.info(f"{camera_name}: using black video placeholder (no clips yet)")
-                return self.black_video_path
             return None
 
         try:
@@ -402,10 +476,6 @@ class CameraManager:
                 return file_name
         except OSError:
             pass
-
-        if self.black_video_path:
-            log.warning(f"{camera_name}: download failed, falling back to black placeholder")
-            return self.black_video_path
 
         return None
     
@@ -575,15 +645,12 @@ class CameraManager:
             # Continue with empty metadata
             self.metadata = []
         
-        # Generate black video placeholder
+        # Generate placeholder videos for Starting / Offline / Error states
         try:
-            width, height = self._detect_resolution_from_clips()
-            self.black_video_path = self._generate_black_video(width, height)
-            if not self.black_video_path:
-                log.warning("Failed to create black video placeholder, cameras without clips will be skipped")
+            PATH_VIDEOS.mkdir(parents=True, exist_ok=True)
+            self._generate_placeholders()
         except Exception as e:
-            log.error(f"Error generating black video placeholder: {e}")
-            self.black_video_path = None
+            log.error(f"Error generating placeholder videos: {e}")
     
     async def close(self) -> None:
         """Properly close all connections and clean up resources.

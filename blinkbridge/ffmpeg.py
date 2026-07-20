@@ -5,6 +5,7 @@ Provides classes for interacting with FFmpeg and FFprobe to:
 - Extract last frames from videos
 - Convert images to videos with matching parameters
 - Create still videos from source footage
+- Generate placeholder videos (Starting, Offline, Error screens)
 """
 import json
 import logging
@@ -18,6 +19,118 @@ from blinkbridge.config import *
 
 
 log = logging.getLogger(__name__)
+
+
+def _find_system_font() -> Optional[str]:
+    """Return the path to a bold sans-serif font suitable for FFmpeg drawtext.
+
+    Checks common installation paths across Alpine (Docker), Ubuntu/Debian,
+    Arch, and Fedora. Returns None if no candidate is found; the caller should
+    then skip the drawtext filter.
+    """
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',  # Ubuntu/Debian
+        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',            # Alpine font-dejavu
+        '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',               # Arch
+        '/usr/share/fonts/dejavu-sans/DejaVuSans-Bold.ttf',       # some distros
+        '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',    # Ubuntu ttf-freefont
+        '/usr/share/fonts/freefont/FreeSansBold.ttf',             # Alpine ttf-freefont
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def generate_placeholder_video(
+    output_path: Union[str, Path],
+    text: str,
+    bg_color: str = 'black',
+    text_color: str = 'white',
+    width: int = 1920,
+    height: int = 1080,
+    fps: int = 15,
+    duration: float = 1.0,
+) -> bool:
+    """Generate a short placeholder video with a solid background and centered text.
+
+    Used to produce the Starting, Offline, and Error screen videos. All output
+    videos are H264/AAC at the given resolution so they are codec-compatible
+    with real Blink clips in the concat stream.
+
+    Args:
+        output_path: Destination file path for the generated video.
+        text: Text to render in the centre of the frame.
+        bg_color: FFmpeg color name or hex for the background (default: 'black').
+        text_color: FFmpeg color name or hex for the text (default: 'white').
+        width: Frame width in pixels (default: 1920).
+        height: Frame height in pixels (default: 1080).
+        fps: Frames per second (default: 15).
+        duration: Duration of the video in seconds (default: 1.0).
+
+    Returns:
+        True if the video was created successfully, False otherwise.
+    """
+    output_path = Path(output_path)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.error(f"generate_placeholder_video: cannot create output directory: {e}")
+        return False
+
+    font_path = _find_system_font()
+    if font_path:
+        vf = (
+            f"drawtext=fontfile='{font_path}'"
+            f":text='{text}'"
+            f":fontcolor={text_color}"
+            f":fontsize=96"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+        log.debug(f"generate_placeholder_video: using font {font_path}")
+    else:
+        vf = None
+        log.warning("generate_placeholder_video: no system font found, skipping text overlay")
+
+    ffmpeg_cmd = [
+        'ffmpeg', *COMMON_FFMPEG_ARGS,
+        '-f', 'lavfi', '-i', f"color={bg_color}:size={width}x{height}:rate={fps}",
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p', '-b:v', '500k',
+        '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '64k',
+        '-t', str(duration),
+        '-movflags', 'faststart',
+    ]
+
+    if vf:
+        ffmpeg_cmd += ['-vf', vf]
+
+    ffmpeg_cmd.append(str(output_path))
+
+    try:
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        log.error(f"generate_placeholder_video: FFmpeg timed out for '{text}'")
+        return False
+    except FileNotFoundError:
+        log.error("generate_placeholder_video: FFmpeg not found in PATH")
+        return False
+    except Exception as e:
+        log.error(f"generate_placeholder_video: unexpected error: {e}")
+        return False
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+        log.error(f"generate_placeholder_video: FFmpeg failed (rc={result.returncode}): {stderr}")
+        return False
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        log.error(f"generate_placeholder_video: output not created at {output_path}")
+        return False
+
+    log.debug(f"generate_placeholder_video: created '{text}' placeholder at {output_path}")
+    return True
 
 class StreamParameters:
     """Extract audio and video stream parameters from a video file using ffprobe.
