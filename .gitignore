@@ -1,5 +1,6 @@
 # Blink credentials
 config/.cred.json
+config/frigate_cameras.yml
 
 # Python
 __pycache__/
