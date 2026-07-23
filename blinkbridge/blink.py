@@ -168,6 +168,33 @@ class CameraManager:
         
     def get_cameras(self) -> iter:
         return self.blink.cameras.keys()
+
+    def is_camera_offline(self, camera_name: str) -> bool:
+        """Return True if the camera or its sync module is offline.
+
+        Checks both the camera's own online status and the parent sync module.
+        Returns False (optimistic) if state is unknown so a refresh failure
+        does not incorrectly trigger OFFLINE.
+        """
+        try:
+            camera = self.blink.cameras[camera_name]
+        except (KeyError, AttributeError):
+            return False
+
+        try:
+            if not camera.online:
+                return True
+        except Exception:
+            return False  # optimistic
+
+        try:
+            sync = getattr(camera, 'sync', None)
+            if sync is not None and not sync.online:
+                return True
+        except Exception:
+            pass  # optimistic
+
+        return False
     
     async def start(self) -> None:
         await self._login()
