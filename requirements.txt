@@ -1,0 +1,3 @@
+rich
+blinkpy @ git+https://github.com/dynacylabs/blinkpy.git
+aiohttp
