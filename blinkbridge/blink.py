@@ -10,6 +10,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth, BlinkTwoFARequiredError, TokenRefreshFailed, LoginError
 from blinkpy.helpers.util import json_load
 from blinkbridge.config import *
+from blinkbridge.ffmpeg import generate_placeholder_video
 
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,9 @@ class CameraManager:
         self.session = ClientSession()
         self.camera_last_record = defaultdict(lambda: None)
         self.metadata = None
+        self.starting_placeholder_path = None
+        self.offline_placeholder_path = None
+        self.error_placeholder_path = None
 
     async def _login(self) -> None:
         """Login to Blink using OAuth v2 authentication."""
@@ -214,6 +218,42 @@ class CameraManager:
     async def start(self) -> None:
         await self._login()
         await self.refresh_metadata()
+        PATH_VIDEOS.mkdir(parents=True, exist_ok=True)
+        self._generate_placeholders()
+
+    def _generate_placeholders(self) -> None:
+        """Generate placeholder videos for Starting, Offline, and Error camera states.
+
+        Creates three short solid-colour videos with text labels so that the
+        stream server always has a valid video to display regardless of camera
+        state, avoiding FFmpeg concat errors when no real clip is available.
+        """
+        duration = CONFIG['still_video_duration']
+        specs = [
+            ('starting_placeholder.mp4', 'Starting...', 'gray',  'white', 'starting_placeholder_path'),
+            ('offline_placeholder.mp4',  'OFFLINE',     'black',  'red',  'offline_placeholder_path'),
+            ('error_placeholder.mp4',    'ERROR',       'black',  'red',  'error_placeholder_path'),
+        ]
+        for filename, text, bg, fg, attr in specs:
+            path = PATH_VIDEOS / filename
+            if path.exists():
+                log.debug(f"Placeholder already exists: {path}")
+                setattr(self, attr, path)
+                continue
+            ok = generate_placeholder_video(
+                output_path=path,
+                text=text,
+                bg_color=bg,
+                text_color=fg,
+                width=1920,
+                height=1080,
+                fps=15,
+                duration=duration,
+            )
+            if ok:
+                setattr(self, attr, path)
+            else:
+                log.error(f"Failed to generate placeholder video: {filename}")
     
     async def close(self) -> None:
         """Properly close all connections and clean up resources."""

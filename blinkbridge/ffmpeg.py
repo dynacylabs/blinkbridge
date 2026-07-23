@@ -1,7 +1,7 @@
 import subprocess
 import json
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 import threading
 import sys
 import logging
@@ -9,6 +9,106 @@ from blinkbridge.config import *
 
 
 log = logging.getLogger(__name__)
+
+
+def _find_system_font() -> Optional[str]:
+    """Return the path to a usable TTF font, or None if none found."""
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',  # Ubuntu/Debian
+        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',            # Alpine font-dejavu
+        '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',               # Arch
+        '/usr/share/fonts/dejavu-sans/DejaVuSans-Bold.ttf',       # some distros
+        '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',    # Ubuntu ttf-freefont
+        '/usr/share/fonts/freefont/FreeSansBold.ttf',             # Alpine ttf-freefont
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def generate_placeholder_video(
+    output_path: Union[str, Path],
+    text: str,
+    bg_color: str = 'black',
+    text_color: str = 'white',
+    width: int = 1920,
+    height: int = 1080,
+    fps: int = 15,
+    duration: float = 0.5,
+) -> bool:
+    """Generate a solid-colour placeholder video with centred text overlay.
+
+    Args:
+        output_path: Destination file path for the generated video.
+        text: Text to overlay on the video.
+        bg_color: Background colour name recognised by FFmpeg (e.g. 'black', 'gray').
+        text_color: Text colour name recognised by FFmpeg.
+        width: Video width in pixels.
+        height: Video height in pixels.
+        fps: Frames per second.
+        duration: Video duration in seconds.
+
+    Returns:
+        True if the video was created successfully, False otherwise.
+    """
+    output_path = Path(output_path)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.error(f"generate_placeholder_video: cannot create output directory: {e}")
+        return False
+
+    font_path = _find_system_font()
+    font_filter = ''
+    if font_path:
+        log.debug(f"generate_placeholder_video: using font {font_path}")
+        font_size = height // 10
+        safe_text = text.replace("'", "\\\\'").replace(':', '\\:')
+        font_filter = (
+            f",drawtext=fontfile='{font_path}':text='{safe_text}'"
+            f":fontcolor={text_color}:fontsize={font_size}"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+    else:
+        log.warning("generate_placeholder_video: no system font found, skipping text overlay")
+
+    vf = f"color={bg_color}:s={width}x{height}:d={duration}:r={fps}{font_filter}"
+
+    cmd = [
+        'ffmpeg', *COMMON_FFMPEG_ARGS,
+        '-f', 'lavfi', '-i', vf,
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p', '-movflags', 'faststart',
+        '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k',
+        '-t', str(duration),
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        log.error(f"generate_placeholder_video: FFmpeg timed out for '{text}'")
+        return False
+    except FileNotFoundError:
+        log.error("generate_placeholder_video: FFmpeg not found in PATH")
+        return False
+    except Exception as e:
+        log.error(f"generate_placeholder_video: unexpected error: {e}")
+        return False
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace')
+        log.error(f"generate_placeholder_video: FFmpeg failed (rc={result.returncode}): {stderr}")
+        return False
+
+    if not output_path.exists():
+        log.error(f"generate_placeholder_video: output not created at {output_path}")
+        return False
+
+    log.debug(f"generate_placeholder_video: created '{text}' placeholder at {output_path}")
+    return True
 
 class StreamParameters:
     def __init__(self, video_file: Union[str, Path]):
