@@ -1,15 +1,20 @@
 services:
   blinkbridge:
-    image: rogerdammit/blinkbridge
+    build: .
+    # image: rogerdammit/blinkbridge
+    ports:
+      - 8765:8765
     volumes:
       - ./config:/config
-      # path for temporary files (video clips, concat files, etc.)
-      - /tmp/blinkbridge:/working
-      # use below instead to use RAM instead of disk for temporary files
-      # - type: tmpfs
-      #   target: /working
-      #   tmpfs:
-      #     size: 52428800  # 50MB  
+      # RAM-backed tmpfs for temporary files (video clips, concat files, stills).
+      # 256MB is sufficient for 25 cameras at maximum workload (~190MB peak).
+      # Increase if you see ENOSPC errors in the logs.
+      - type: tmpfs
+        target: /working
+        tmpfs:
+          size: 268435456  # 256MB
+      # Bind-mount alternative (disk-backed, slower but survives restarts):
+      # - /tmp/blinkbridge:/working
     tty: true # for color logs
     environment:
       - BLINKBRIDGE_CONFIG=/config/config.json
