@@ -16,6 +16,7 @@ class StreamServer:
         self.stream_name = stream_name
         self.stream_name_sanitized = stream_name.replace(' ', '_').lower()
         self.current_still_video = None
+        self.failure_detected: bool = False  # True after first failure spotted, until restart attempted
 
     def _run_server(self) -> str:
         output_url = f"{RTSP_URL}/{self.stream_name_sanitized}"
@@ -110,6 +111,23 @@ class StreamServer:
         if self.is_running():
             log.info(f"{self.stream_name}: stopping server")
             self.process.kill()
+
+    def swap_to_placeholder(self, placeholder_video: Union[str, Path]) -> None:
+        """Immediately switch the stream to a static placeholder video.
+
+        Enqueues the placeholder directly into the next concat file so the
+        stream transitions without restarting FFmpeg.  The currently queued
+        still video is left in place so there is no gap.
+
+        Args:
+            placeholder_video: Path to the placeholder video file to enqueue.
+        """
+        placeholder_video = Path(placeholder_video)
+        if not placeholder_video.exists():
+            log.warning(f"{self.stream_name}: placeholder video not found: {placeholder_video}")
+            return
+        log.debug(f"{self.stream_name}: swapping to placeholder {placeholder_video.name}")
+        self._enqueue_clip(placeholder_video)
 
     def start_server(self, file_name_initial_video: Union[str, Path]) -> None:
         log.debug(f"{self.stream_name}: starting server with {file_name_initial_video}")
