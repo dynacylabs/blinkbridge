@@ -9,6 +9,7 @@ from rich.highlighter import NullHighlighter, JSONHighlighter
 from blinkbridge.stream_server import StreamServer
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
+from blinkbridge.web import BlinkBridgeWebServer
 
 
 log = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class Application:
         self.stream_servers = {}
         self.cam_manager = None
         self.running = False
+        self.web_server = None
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> StreamServer:
         if redownload:
@@ -51,7 +53,15 @@ class Application:
         
     async def start(self) -> None:
         self.running = True
+
+        # Start the web server before camera login so the /2fa endpoint is
+        # reachable if Blink requires two-factor authentication.
+        await self._start_web_server()
+
         self.cam_manager = CameraManager()
+        if self.web_server is not None:
+            self.cam_manager.twofa_provider = self.web_server.request_2fa_code
+            self.cam_manager.credentials_provider = self.web_server.request_credentials
         await self.cam_manager.start()
 
         # get enabled cameras
@@ -110,6 +120,55 @@ class Application:
         
         for ss in self.stream_servers.values():
             ss.close()
+
+        if self.web_server:
+            await self.web_server.stop()
+
+    async def _start_web_server(self) -> None:
+        """Create and start the optional utility web server."""
+        web_cfg = CONFIG.get('web', {})
+        if not web_cfg.get('enabled', False):
+            return
+        self.web_server = BlinkBridgeWebServer(
+            host=str(web_cfg.get('host', '0.0.0.0')),
+            port=int(web_cfg.get('port', 8765)),
+            frigate_export_path=PATH_CONFIG / 'frigate_cameras.yml',
+        )
+        self.web_server.restart_callback = self.restart
+        await self.web_server.start()
+        log.info(f"Web server enabled at http://{web_cfg.get('host', '0.0.0.0')}:{web_cfg.get('port', 8765)}")
+
+    async def restart(self) -> None:
+        """Restart camera streams without stopping the web server."""
+        log.info("Restarting BlinkBridge (streams + Blink connection)...")
+        self.running = False
+        for camera_name, ss in list(self.stream_servers.items()):
+            try:
+                ss.close()
+            except Exception as e:
+                log.warning(f"{camera_name}: error stopping stream during restart: {e}")
+        self.stream_servers.clear()
+        if self.cam_manager:
+            try:
+                await self.cam_manager.close()
+            except Exception as e:
+                log.warning(f"Error closing camera manager during restart: {e}")
+            self.cam_manager = None
+        self.running = True
+        self.cam_manager = CameraManager()
+        if self.web_server is not None:
+            self.cam_manager.twofa_provider = self.web_server.request_2fa_code
+            self.cam_manager.credentials_provider = self.web_server.request_credentials
+        await self.cam_manager.start()
+        enabled_cameras = set(CONFIG['cameras']['enabled']) if CONFIG['cameras']['enabled'] else set(self.cam_manager.get_cameras())
+        enabled_cameras = enabled_cameras - set(CONFIG['cameras']['disabled'])
+        for camera in self.cam_manager.get_cameras():
+            if camera not in enabled_cameras:
+                continue
+            ss = await self.start_stream(camera)
+            ss.failure_count = 0
+            ss.datetime_started = datetime.now()
+        log.info("Restart complete — resuming camera monitoring")
 
 async def main() -> None:
     app = Application()

@@ -34,6 +34,12 @@ def load_config_file(file_name: Union[str, Path]) -> None:
     PATH_CONCAT = Path(CONFIG['paths']['concat'])
     PATH_CONFIG = Path(CONFIG['paths']['config'])
 
+    # Optional BlinkBridge utility web server
+    CONFIG.setdefault('web', {})
+    CONFIG['web'].setdefault('enabled', False)
+    CONFIG['web'].setdefault('host', '0.0.0.0')
+    CONFIG['web'].setdefault('port', 8765)
+
 config_file = os.getenv('BLINKBRIDGE_CONFIG', 'config.json')
 load_config_file(config_file)
  
