@@ -140,6 +140,7 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['cameras'].setdefault('max_failures', 3)
         CONFIG['blink'].setdefault('history_days', 90)
         CONFIG['blink'].setdefault('poll_interval', 1)
+        CONFIG['blink'].setdefault('metadata_pages', 10)
 
         # Optional export of Frigate cameras block (snippet only)
         CONFIG.setdefault('frigate_export', {})
