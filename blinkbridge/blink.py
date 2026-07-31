@@ -731,6 +731,34 @@ class CameraManager:
             Iterator of camera name strings
         """
         return self.blink.cameras.keys()
+
+    def recently_known_cameras(self, within_days: int = 14) -> set:
+        """Return cached camera names with a clip newer than within_days.
+
+        self.blink.cameras only reflects the live Blink snapshot -- if an
+        entire sync module drops off Blink's cloud, its cameras vanish from
+        that snapshot immediately, not just when they go offline. Without
+        this, such a camera would never get a stream server at all (since
+        it's absent from get_cameras()), so it could never reach
+        is_camera_offline()'s KeyError->True check and would stay invisible
+        indefinitely instead of showing OFFLINE. Falling back to the
+        persistent clip cache for recently-active cameras closes that gap.
+        A camera with no clip in that long is assumed retired rather than
+        temporarily down, so it isn't resurrected forever.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
+        result = set()
+        for name, clip in self.clip_cache.items():
+            created_at = clip.get('created_at')
+            if not created_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            except ValueError:
+                continue
+            if dt >= cutoff:
+                result.add(name)
+        return result
     
     async def start(self) -> None:
         """Initialize the camera manager.

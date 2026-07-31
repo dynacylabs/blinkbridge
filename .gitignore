@@ -44,3 +44,4 @@ __pycache__
 
 # Config
 config/config.json
+config/clip_cache.json

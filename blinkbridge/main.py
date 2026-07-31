@@ -187,7 +187,12 @@ class Application:
         if CONFIG['cameras']['enabled']:
             enabled_cameras = set(CONFIG['cameras']['enabled'])
         else:
-            enabled_cameras = set(self.cam_manager.get_cameras())
+            # Union in recently-known cameras from the clip cache, not just
+            # Blink's live snapshot -- a camera whose whole sync module is
+            # temporarily unreachable would otherwise never get a stream
+            # server and could never be flagged OFFLINE (see
+            # recently_known_cameras() docstring).
+            enabled_cameras = set(self.cam_manager.get_cameras()) | self.cam_manager.recently_known_cameras()
         
         return enabled_cameras - set(CONFIG['cameras']['disabled'])
     
@@ -316,6 +321,7 @@ class Application:
                 last_log_time = datetime.now()
             
             await self._check_cameras_for_updates()
+            await self._discover_new_cameras()
             await self._restart_failed_streams()
             await asyncio.sleep(CONFIG['blink']['poll_interval'])
     
@@ -329,6 +335,39 @@ class Application:
             f"Poll #{poll_count}: {len(self.stream_servers)} cameras active"
         )
     
+    async def _discover_new_cameras(self) -> None:
+        """Start streams for any enabled cameras that have appeared since startup.
+
+        self.blink.cameras only reflects whatever Blink reported as of the
+        last refresh() call, and the initial camera list is captured once
+        at startup (_initialize_camera_streams) -- so a camera, or an
+        entire sync module, that's down when the container starts is
+        silently invisible for the rest of this process's life, even after
+        it comes back online. This periodically re-checks for newly
+        enabled-and-discovered cameras and starts a stream for each one,
+        the same way _initialize_camera_streams does at startup.
+        """
+        try:
+            enabled_cameras = self._get_enabled_cameras()
+        except Exception as e:
+            log.error(f"Error computing enabled cameras during discovery: {e}")
+            return
+
+        new_cameras = enabled_cameras - set(self.stream_servers.keys())
+        if not new_cameras:
+            return
+
+        for camera_name in sorted(new_cameras):
+            if not self.running:
+                break
+            log.info(f"{camera_name}: newly discovered (or returned) -- starting stream")
+            ss = await self.start_stream(camera_name)
+            if ss is None:
+                log.warning(f"{camera_name}: failed to start stream for newly discovered camera")
+                continue
+            ss.failure_count = 0
+            ss.datetime_started = datetime.now()
+
     async def _check_cameras_for_updates(self) -> None:
         """Run the state machine for every active camera stream.
 
