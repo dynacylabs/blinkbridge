@@ -102,14 +102,15 @@ class CameraManager:
         session: aiohttp ClientSession for HTTP requests
         blink: BlinkPy Blink instance
         camera_last_record: Dict tracking last recorded event per camera
-        metadata: List of video metadata from Blink API
+        clip_cache: Dict mapping camera name to its most-recent clip metadata
         black_video_path: Path to black placeholder video
     """
     
     def __init__(self) -> None:
         self.session: ClientSession = ClientSession()
         self.camera_last_record: Dict[str, Optional[str]] = defaultdict(lambda: None)
-        self.metadata: Optional[list] = None
+        self.clip_cache: Dict[str, dict] = {}
+        self.last_metadata_refresh: Optional[datetime] = None
         self.black_video_path: Optional[Path] = None
         self.starting_placeholder_path: Optional[Path] = None
         self.offline_placeholder_path: Optional[Path] = None
@@ -304,12 +305,18 @@ class CameraManager:
         even if the camera object itself reports online (blinkpy may not propagate
         sync-module outages to individual camera objects in all cases).
 
-        Returns False (optimistic) if the camera is not found or state is unknown,
-        so an ambiguous refresh failure does not incorrectly trigger OFFLINE.
+        A camera missing entirely from self.blink.cameras (e.g. its whole sync
+        module dropped off Blink's cloud) is treated as offline -- that's a
+        stronger signal than a camera being present but merely flagged offline,
+        not a reason to be optimistic. Only self.blink itself not being ready
+        (AttributeError, e.g. mid-(re)login) stays optimistic, so a startup race
+        doesn't falsely flag every camera as offline.
         """
         try:
             camera = self.blink.cameras[camera_name]
-        except (KeyError, AttributeError):
+        except KeyError:
+            return True
+        except AttributeError:
             return False
 
         try:
@@ -381,34 +388,129 @@ class CameraManager:
         """
         return (1920, 1080)
     
-    async def refresh_metadata(self) -> None:
-        """Refresh video metadata from Blink API.
-        
-        Fetches recent video clips based on CONFIG['blink']['history_days'].
-        Uses CONFIG['blink']['metadata_pages'] to control pagination depth
-        (~25 items per page). Updates self.metadata with the latest available clips.
-        
-        Raises:
-            Exception: If API call fails
-        """
+    def _clip_cache_path(self) -> Path:
+        return PATH_CONFIG / "clip_cache.json"
+
+    def _load_clip_cache(self) -> None:
+        """Load the persistent per-camera clip cache from disk, if present."""
+        path = self._clip_cache_path()
         try:
-            log.debug('refreshing video metadata')
-            dt_past = datetime.now(timezone.utc) - timedelta(days=CONFIG['blink']['history_days'])
-            stop = CONFIG['blink']['metadata_pages'] + 1  # BlinkPy uses range(1, stop)
-            self.metadata = await self.blink.get_videos_metadata(since=str(dt_past), stop=stop)
-            count = len(self.metadata) if self.metadata else 0
-            log.debug(f'Retrieved {count} video metadata entries')
-            if self.metadata:
-                cameras_with_clips = defaultdict(int)
-                for m in self.metadata:
-                    if not m.get('deleted') and m.get('source') != 'snapshot':
-                        cameras_with_clips[m.get('device_name', 'unknown')] += 1
-                log.debug(f'Clips per camera: {dict(cameras_with_clips)}')
+            if path.exists():
+                with open(path, 'r', encoding='utf-8') as f:
+                    self.clip_cache = json.load(f)
+                log.debug(f"Loaded clip cache from {path} ({len(self.clip_cache)} cameras)")
+        except (json.JSONDecodeError, IOError) as e:
+            log.warning(f"Failed to load clip cache from {path}: {e} -- starting fresh")
+            self.clip_cache = {}
+
+    def _save_clip_cache(self) -> None:
+        """Persist the per-camera clip cache to disk so it survives restarts."""
+        path = self._clip_cache_path()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(self.clip_cache, f)
+        except IOError as e:
+            log.warning(f"Failed to save clip cache to {path}: {e}")
+
+    def _merge_clips(self, items: list) -> int:
+        """Merge fetched clip metadata into the per-camera cache.
+
+        Keeps only the single most recent non-deleted, non-snapshot clip per
+        camera -- this is what makes the cache immune to being crowded out
+        by high-motion cameras: a quiet camera's one cached entry is never
+        evicted by another camera's clips, no matter how many there are.
+
+        Returns:
+            Number of cameras whose cached entry was updated.
+        """
+        updated = 0
+        for m in items or []:
+            if m.get('deleted') or m.get('source') == 'snapshot':
+                continue
+            name = m.get('device_name')
+            if not name:
+                continue
+            existing = self.clip_cache.get(name)
+            if existing is None or m.get('created_at', '') > existing.get('created_at', ''):
+                self.clip_cache[name] = m
+                updated += 1
+        return updated
+
+    async def refresh_metadata(self) -> None:
+        """Refresh the per-camera clip cache from the Blink API.
+
+        Maintains a persistent cache (clip_cache.json in the config directory)
+        mapping each camera to its single most-recent known clip. This avoids
+        the crowding-out problem of a shared, re-derived-every-poll pooled
+        clip list: on an account with many cameras and highly uneven motion
+        activity, a few high-motion cameras can otherwise fill the entire
+        fetched window, permanently hiding quieter cameras' most recent clip
+        even though it's well within CONFIG['blink']['history_days'].
+
+        - First run (empty cache): a one-time deep seed fetch, paginating
+          from now until every currently known camera has a cached entry or
+          a safety page cap is hit (whichever comes first).
+        - Subsequent runs: a small incremental fetch of only what's new
+          since the last successful refresh (CONFIG['blink']['metadata_pages']
+          pages, plenty for a single poll interval's worth of new clips),
+          merged into the existing cache. Cameras that stayed quiet keep
+          their previously cached entry indefinitely.
+
+        Raises:
+            Exception: If the API call fails
+        """
+        SEED_PAGE_CAP = 200  # ~5000 clips; safety ceiling so one silent camera can't stall startup forever
+        INCREMENTAL_OVERLAP = timedelta(minutes=5)  # cheap insurance against clock drift / race conditions
+
+        if not self.clip_cache:
+            self._load_clip_cache()
+
+        known_cameras = set(self.blink.cameras.keys()) if self.blink.cameras else set()
+        seeding = not self.clip_cache
+
+        try:
+            if seeding:
+                log.info("No cached clips found -- performing one-time deep seed fetch")
+                dt_past = datetime.now(timezone.utc) - timedelta(days=CONFIG['blink']['history_days'])
+                page = 1
+                fetched_total = 0
+                while page < SEED_PAGE_CAP:
+                    response = await blink_api.request_videos(self.blink, time=dt_past.timestamp(), page=page)
+                    try:
+                        result = response["media"]
+                        if not result:
+                            break
+                    except (KeyError, TypeError):
+                        break
+                    fetched_total += len(result)
+                    self._merge_clips(result)
+                    page += 1
+                    if known_cameras and known_cameras <= self.clip_cache.keys():
+                        log.info(
+                            f"Seed fetch covered all {len(known_cameras)} known cameras "
+                            f"after {page - 1} pages ({fetched_total} clips)"
+                        )
+                        break
+                else:
+                    missing = known_cameras - self.clip_cache.keys()
+                    log.warning(
+                        f"Seed fetch hit the {SEED_PAGE_CAP}-page cap with cameras still "
+                        f"uncovered: {sorted(missing)} -- they'll get a cached clip on their "
+                        f"next real motion event instead"
+                    )
+            else:
+                floor_dt = datetime.now(timezone.utc) - timedelta(days=CONFIG['blink']['history_days'])
+                since_dt = max((self.last_metadata_refresh or floor_dt) - INCREMENTAL_OVERLAP, floor_dt)
+                stop = CONFIG['blink']['metadata_pages'] + 1  # BlinkPy uses range(1, stop)
+                new_items = await self.blink.get_videos_metadata(since=str(since_dt), stop=stop)
+                updated = self._merge_clips(new_items)
+                log.debug(f"Incremental metadata refresh: {updated} camera(s) updated")
+
+            self._save_clip_cache()
+            self.last_metadata_refresh = datetime.now(timezone.utc)
+            log.debug(f"Clip cache covers {len(self.clip_cache)} camera(s): {sorted(self.clip_cache.keys())}")
         except Exception as e:
             log.error(f"Failed to refresh video metadata: {e}")
-            # Keep existing metadata if refresh fails
-            if self.metadata is None:
-                self.metadata = []
             raise
 
     async def save_latest_clip(self, camera_name: str, force: bool=False) -> Optional[Path]:
@@ -438,10 +540,9 @@ class CameraManager:
             log.warning(f"{camera_name}: error checking if file exists: {e}")
 
         try:
-            media = next((m for m in self.metadata if m['device_name'] == camera_name 
-                        if not m['deleted'] and m['source'] != 'snapshot'), None)
+            media = self.clip_cache.get(camera_name)
         except Exception as e:
-            log.error(f"{camera_name}: error searching metadata: {e}")
+            log.error(f"{camera_name}: error searching clip cache: {e}")
             media = None
 
         if media is None:
@@ -651,8 +752,9 @@ class CameraManager:
             await self.refresh_metadata()
         except Exception as e:
             log.warning(f"Failed to refresh metadata during startup: {e}")
-            # Continue with empty metadata
-            self.metadata = []
+            # Continue with whatever's in the cache (possibly empty) -- individual
+            # cameras will still progress through STARTING and pick up a clip once
+            # a later refresh or a real motion event succeeds.
         
         # Generate placeholder videos for Starting / Offline / Error states
         try:
