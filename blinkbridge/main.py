@@ -206,14 +206,19 @@ class Application:
             All cameras start with the grey "Starting..." placeholder.  The
             monitoring loop fetches clips and drives state transitions after
             all streams are up.
+
+            Iterates enabled_cameras directly rather than filtering
+            self.cam_manager.get_cameras() -- enabled_cameras can include
+            cameras recently_known_cameras() recovered from the clip cache
+            that are absent from Blink's live snapshot (e.g. a sync module
+            that's down right now), and those still need a stream_servers
+            entry at startup, not just on the first _discover_new_cameras()
+            pass a poll cycle later.
         """
-        for camera in self.cam_manager.get_cameras():
+        for camera in sorted(enabled_cameras):
             if not self.running:
                 log.info("Shutdown requested during startup, stopping stream creation")
                 break
-
-            if camera not in enabled_cameras:
-                continue
 
             ss = await self.start_stream(camera)
             if ss is None:
