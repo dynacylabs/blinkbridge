@@ -17,11 +17,29 @@
         "password": ""
       },
       "history_days": 90,
-      "poll_interval": 1
+      "poll_interval": 60,
+      "metadata_pages": 10
     },
     "rtsp_server": {
       "address": "mediamtx",
       "port": 8554
+    },
+    "frigate_export": {
+      "enabled": true,
+      "output_path": "/config/frigate_cameras.yml",
+      "rtsp_host": "mediamtx",
+      "rtsp_port": 8554,
+      "roles": ["detect", "record"],
+      "detect_defaults": {
+        "width": 1280,
+        "height": 720,
+        "fps": 1
+      }
+    },
+    "web": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 8765
     },
     "log_level": "INFO"
 }

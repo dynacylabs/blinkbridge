@@ -39,5 +39,9 @@ ENV/
 .tmp/
 tmp/
 
+# Pycache
+__pycache__
+
 # Config
 config/config.json
+config/clip_cache.json
